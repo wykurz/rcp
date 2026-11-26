@@ -105,7 +105,7 @@ class HistoryModelTests(unittest.TestCase):
         cases, outside = history.model({record["run_key"]: record}, {})
         self.assertEqual(outside, 2)
         self.assertEqual(cases[CASE][0]["duration"]["samples"], 4)
-        self.assertEqual(set(cases), set(history.CASES))
+        self.assertEqual(set(cases), set(history.FIRST.cases))
 
     def test_cpu_is_user_plus_system_per_copy_before_the_median(self):
         record, raw, worker = example()
@@ -504,8 +504,8 @@ class HistoryRenderTests(unittest.TestCase):
         template, raw, worker = example()
         base_measurements, base_trials = template["measurements"], raw["trials"]
         template["measurements"] = [dict(item, case_id=case)
-            for case in history.CASES for item in base_measurements]
-        raw["trials"] = [dict(item, case_id=case) for case in history.CASES for item in base_trials]
+            for case in history.FIRST.cases for item in base_measurements]
+        raw["trials"] = [dict(item, case_id=case) for case in history.FIRST.cases for item in base_trials]
         records, extras = {}, {}
         for index in range(150):
             record = copy.deepcopy(template)

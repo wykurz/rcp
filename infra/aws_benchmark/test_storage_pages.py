@@ -49,8 +49,8 @@ class StorageTrendTests(unittest.TestCase):
         self.assertEqual({trend: history.ROWS[trend][:2] for trend in ("nfs", "memory")},
                          dict(nfs=("Copies between NFS mounts", "nfs.html"), memory=("Copies in memory", "memory.html")))
         # a file set of other storage is named with its storage: its files are those of another set
-        self.assertEqual(history.OTHER_CASES, {NFS_SET: ON_NFS, MEMORY_SET: IN_MEMORY})
-        self.assertEqual(list(history.CASES), FILE_SETS)
+        self.assertEqual(history.FIRST.other, {NFS_SET: ON_NFS, MEMORY_SET: IN_MEMORY})
+        self.assertEqual(list(history.FIRST.cases), FILE_SETS)
 
     def test_each_kind_of_copy_on_other_storage_has_a_trend_on_its_own_file_set(self):
         records, companions = split(weeks(2, suite=WEEKLY))
@@ -152,7 +152,7 @@ class StorageDescriptionTests(unittest.TestCase):
         # and the file sets they name are the ones the suites measure there
         self.assertEqual({kind: cases for kind, cases in common.MATRIX_OTHER_FILE_SETS["all"].items()},
                          dict(nfs=(NFS_SET,), memory=(MEMORY_SET,)))
-        self.assertEqual({trend: history.PLOTTED[trend] for trend in ("nfs", "memory")},
+        self.assertEqual({trend: history.plotted(trend, history.FIRST) for trend in ("nfs", "memory")},
                          dict(nfs=(NFS_SET,), memory=(MEMORY_SET,)))
 
 

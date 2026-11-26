@@ -59,7 +59,7 @@ class ToolTrendTests(unittest.TestCase):
         for trend, plotted in (("rcmp", MANY_FILES), ("rlink", MANY_FILES), ("rrm", EVERY)):
             with self.subTest(trend=trend):
                 cases, outside = history.model(records, companions, trend)
-                self.assertEqual([history.CASES[case] for case in cases], plotted)
+                self.assertEqual([history.FIRST.cases[case] for case in cases], plotted)
                 self.assertEqual({len(points) for points in cases.values()}, {2})
                 # what a tool does with a thousand files is not a trend, and is not counted as left out either
                 self.assertEqual(outside, 0)
@@ -231,7 +231,7 @@ class ToolRunPageTests(unittest.TestCase):
     def test_what_the_arrays_did_is_tabulated_for_tool_runs_as_for_copies(self):
         rows = [dict(case_id="tiny-1k-10240k", scenario=scenario, written=1.0e9, destination_busy=.5, read=2.0e9,
                      source_busy=.25, cpu=.6) for scenario in ("remote-rrm", "local-rrm", "local", "local-rcmp")]
-        html = history.storage_html("43200000001-1", "runs/x.html", rows)
+        html = history.storage_html("43200000001-1", "runs/x.html", rows, history.FIRST)
         self.assertIn("<th>File set</th><th>Scenario</th>", html)
         # in the order of the cells of a run, whatever order the rows came in
         self.assertEqual(re.findall(r"<tr><td>1 KB files</td><td>([^<]+)</td>", html),

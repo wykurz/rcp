@@ -147,7 +147,7 @@ class StorageTableTests(unittest.TestCase):
     def table(self, *runs, **options):
         record, extra = runs[0] if runs else sampled(**options)
         return history.storage_html(record["identity"]["run"], "runs/" + record["run_key"] + ".html",
-                                    diagnostics.storage_use(extra, record))
+                                    diagnostics.storage_use(extra, record), history.FIRST)
 
     def test_the_table_names_each_file_set_and_copy_and_gives_rates_and_shares(self):
         html = self.table()
@@ -169,7 +169,7 @@ class StorageTableTests(unittest.TestCase):
         record, extra = sampled("matrix-all-local+remote")
         rows = diagnostics.storage_use(extra, record)
         self.assertEqual(len(rows), 8)
-        html = history.storage_html("1-1", "runs/x.html", rows[::-1])
+        html = history.storage_html("1-1", "runs/x.html", rows[::-1], history.FIRST)
         self.assertEqual([tuple(re.findall(r"<td>([^<]+)</td>", line)[:2]) for line in html.split("<tr>")[2:]],
                          [(name, copy) for name in ("1 GB files", "100 MB files", "1 MB files", "1 KB files")
                           for copy in ("Local copy", "Remote copy over loopback")])
@@ -179,7 +179,7 @@ class StorageTableTests(unittest.TestCase):
         record, extra = sampled("matrix-commission-local+remote")
         rows = diagnostics.storage_use(extra, record)
         self.assertEqual(len(rows), 4)
-        self.assertEqual(history.storage_html("1-1", "runs/x.html", rows), "")
+        self.assertEqual(history.storage_html("1-1", "runs/x.html", rows, history.FIRST), "")
 
     def test_a_missing_figure_reads_unavailable_and_a_slow_small_one_keeps_its_digits(self):
         lost = dict(status="unavailable")
@@ -188,7 +188,7 @@ class StorageTableTests(unittest.TestCase):
         self.assertIn("<td>0.08 GB/s</td><td>21%</td><td>0.07 GB/s</td><td>unavailable</td><td>65%</td>", html)
 
     def test_no_rows_no_table(self):
-        self.assertEqual(history.storage_html("1-1", "runs/x.html", []), "")
+        self.assertEqual(history.storage_html("1-1", "runs/x.html", [], history.FIRST), "")
 
 
 class SetupPageTests(unittest.TestCase):
@@ -221,7 +221,8 @@ class SetupPageTests(unittest.TestCase):
 
     def test_the_table_of_the_newest_run_follows_the_description(self):
         record, extra = sampled()
-        table = history.storage_html(record["identity"]["run"], "runs/x.html", diagnostics.storage_use(extra, record))
+        table = history.storage_html(record["identity"]["run"], "runs/x.html", diagnostics.storage_use(extra, record),
+                                     history.FIRST)
         text = diagnostics.configuration_html([], remote=True, storage=table)
         section = text[text.index("<section aria-labelledby='storage'>"):]
         section = section[:section.index("</section>")]

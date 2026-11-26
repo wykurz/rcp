@@ -45,17 +45,6 @@ TRENDS = (*COPIES, *TOOLS)
 # what a tool does with a file set, after "files of … each"
 ACTIONS = {"rcmp": "compared with their source by rcmp, by file size,", "rlink": "hard-linked into a new tree by rlink",
            "rrm": "removed by rrm"}
-CASES = {
-    "bulk-1g-1tb": "1 GB files",
-    "bulk-100m-1024gb": "100 MB files",
-    "bulk-1m-1024gb": "1 MB files",
-    "tiny-1k-10240k": "1 KB files",
-}
-# the file sets of other storage. Their files are those of a set of the arrays, so each is named
-# with its storage. The copies of one kind measure each, and the tools after those copies
-OTHER_CASES = {"tiny-1k-700x1024": "1 KB files on NFS", "tiny-1k-10240k-memory": "1 KB files in memory"}
-# what every file set with a trend is called
-NAMES = {**CASES, **OTHER_CASES}
 METRICS = (
     ("duration", "Copy duration", "s"),
     ("cpu", "CPU time", "s"),
@@ -93,14 +82,55 @@ ROWS = {
     MEMORY: ("Copies in memory", "memory.html", "CPU time, peak memory and data tables"),
 }
 ROWS.update({tool: (TOOL_TITLES[tool], tool + ".html", "CPU time, peak memory and data tables") for tool in TOOLS})
-# the file sets each page plots: the copies on other storage their own, and a tool every set
-# where it takes real time. What a tool does with a thousand files takes milliseconds: that is
-# noise, not a trend. The file sets of other storage have a section once a run has a cell there
-PLOTTED = {NFS: ("tiny-1k-700x1024",), MEMORY: ("tiny-1k-10240k-memory",),
-           "rcmp": ("bulk-1m-1024gb", "tiny-1k-10240k", *OTHER_CASES),
-           "rlink": ("bulk-1m-1024gb", "tiny-1k-10240k", *OTHER_CASES), "rrm": (*CASES, *OTHER_CASES)}
-# the file set whose tool trends the first page shows: the one with the most files
-MOST_FILES = "tiny-1k-10240k"
+
+
+@dataclass(frozen=True)
+class FileSets:
+    """The file sets of one generation of the weekly run, as the pages name and plot them."""
+    # the file sets of the arrays, each with what it is called, in page order
+    cases: dict
+    # the file sets of other storage. Their files are those of a set of the arrays, so each is
+    # named with its storage. The copies of one kind measure each, and the tools after those copies
+    other: dict
+    # the file sets a page plots when they are not all those of the arrays: the copies on other
+    # storage their own, and a tool every set where it takes real time. A file set of other
+    # storage has a section on a tool's page once a run has a cell there
+    plotted: dict
+    # the file set whose tool trends the first page shows: the one with the most files
+    most_files: str
+    # whether the tools are timed on the file sets that their pages leave out
+    timed: bool
+
+
+# the file sets there were first: a terabyte of large files, ten million small ones, and the tools
+# timed after every copy. What a tool does with a thousand files takes milliseconds: that is
+# noise, not a trend, so the page of a tool leaves those file sets out
+FIRST = FileSets(
+    cases={"bulk-1g-1tb": "1 GB files", "bulk-100m-1024gb": "100 MB files", "bulk-1m-1024gb": "1 MB files",
+           "tiny-1k-10240k": "1 KB files"},
+    other={"tiny-1k-700x1024": "1 KB files on NFS", "tiny-1k-10240k-memory": "1 KB files in memory"},
+    plotted={NFS: ("tiny-1k-700x1024",), MEMORY: ("tiny-1k-10240k-memory",),
+             "rcmp": ("bulk-1m-1024gb", "tiny-1k-10240k", "tiny-1k-700x1024", "tiny-1k-10240k-memory"),
+             "rlink": ("bulk-1m-1024gb", "tiny-1k-10240k", "tiny-1k-700x1024", "tiny-1k-10240k-memory"),
+             "rrm": ("bulk-1g-1tb", "bulk-100m-1024gb", "bulk-1m-1024gb", "tiny-1k-10240k", "tiny-1k-700x1024",
+                     "tiny-1k-10240k-memory")},
+    most_files="tiny-1k-10240k", timed=True)
+# the file sets of the weekly suite (common.MATRIX_WEEKLY): those before them made smaller, so
+# that a command takes one to five minutes, and the tools timed on the sets of small files only.
+# The mounts of the network filesystem show the same file set as before
+SIZED = FileSets(
+    cases={"bulk-1g-400gb": "1 GB files", "bulk-100m-400gb": "100 MB files", "bulk-1m-400gb": "1 MB files",
+           "tiny-1k-4096k": "1 KB files"},
+    other={"tiny-1k-700x1024": "1 KB files on NFS", "tiny-1k-4096k-memory": "1 KB files in memory"},
+    plotted={NFS: ("tiny-1k-700x1024",), MEMORY: ("tiny-1k-4096k-memory",),
+             **{tool: ("tiny-1k-4096k", "tiny-1k-700x1024", "tiny-1k-4096k-memory") for tool in TOOLS}},
+    most_files="tiny-1k-4096k", timed=False)
+# oldest first. The pages show one generation as the current one: see `generation`
+GENERATIONS = (FIRST, SIZED)
+# what every file set with a trend is called
+NAMES = {case: title for sets in GENERATIONS for case, title in (*sets.cases.items(), *sets.other.items())}
+# the key under which a page's model holds the file sets of the generations before the current one
+EARLIER = "earlier"
 MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 DAY = 86400
 
@@ -204,13 +234,30 @@ def samples(scenario):
     return ("tool run", "tool runs") if scenario in TOOLS else ("copy", "copies")
 
 
-def plotted(scenario):
-    """The file sets with a trend under a scenario, in page order."""
-    return PLOTTED.get(scenario, tuple(CASES))
+def plotted(scenario, sets):
+    """The file sets of one generation with a trend under a scenario, in page order."""
+    return sets.plotted.get(scenario, tuple(sets.cases))
 
 
-def _points(value, extra, scenario=LOCAL):
-    """Summarize the build under test for each file set of one qualified record, on one trend."""
+def generation(records):
+    """The file sets that the pages show as the current ones: those of the newest generation that a run measured.
+
+    Until a suite has measured something, the pages are what they were: it has nothing to show.
+    Only a qualified run has measurements. A file set that two generations share, as the one on
+    the network filesystem, decides nothing.
+    """
+    measured = {item["case_id"] for value in records.values() for item in value["measurements"]}
+    current, known = GENERATIONS[0], set()
+    for sets in GENERATIONS:
+        own = {*sets.cases, *sets.other} - known
+        if measured & own:
+            current = sets
+        known |= own
+    return current
+
+
+def _points(value, extra, scenario, sets):
+    """Summarize the build under test for each file set of one generation in one qualified record, on one trend."""
     started, identity = utc(value["timestamp"]), value["identity"]
     # identical binaries make the reference copies further samples of the same build
     roles = (CURRENT, REFERENCE) if value["comparison"] == projection.IDENTICAL_BINARIES else (CURRENT,)
@@ -228,7 +275,7 @@ def _points(value, extra, scenario=LOCAL):
         require(key not in seen, "duplicate history case and variant")
         seen.add(key)
         if key[1] in pooled:
-            if key[0] in plotted(scenario) and key[2] in roles:
+            if key[0] in plotted(scenario, sets) and key[2] in roles:
                 selected.setdefault(key[0], []).append(measurement)
             elif key[0] not in NAMES or key[2] not in roles:
                 # a file set that a tool's page leaves out on purpose is not one it failed to place
@@ -300,15 +347,19 @@ def _link(points):
         point.update(segment=segment, changes=changes, starts_segment=starts)
 
 
-def model(records, companions, scenario=LOCAL):
-    """Summarize each qualified run per file set under one scenario and link the runs in time order."""
+def model(records, companions, scenario=LOCAL, sets=None):
+    """Summarize each qualified run per file set under one scenario and link the runs in time order.
+
+    The file sets are those of the current generation, or of `sets`.
+    """
     require(isinstance(records, dict) and len(records) <= projection.MAX_PUBLIC_HISTORY_RUNS and
             isinstance(companions, dict) and set(companions) <= set(records),
             "history input exceeds its bounded record set")
     # a file set of other storage has its section on a tool's page once a run has a cell on it
     tried = {cell["case_id"] for value in records.values() for cell in value.get("cells", ())}
-    cases, outside = {case: [] for case in plotted(scenario)
-                      if case in CASES or scenario not in TOOLS or case in tried}, 0
+    sets = sets or generation(records)
+    cases, outside = {case: [] for case in plotted(scenario, sets)
+                      if case in sets.cases or scenario not in TOOLS or case in tried}, 0
     for run_key, value in sorted(records.items()):
         projection.validate_public(value)
         require(value["run_key"] == run_key, "history record identity differs")
@@ -317,7 +368,7 @@ def model(records, companions, scenario=LOCAL):
             diagnostics.validate(extra, value)
         if not value["benchmark_valid"]:
             continue
-        points, skipped = _points(value, extra, scenario)
+        points, skipped = _points(value, extra, scenario, sets)
         outside += skipped
         for case, item in points.items():
             cases[case].append(item)
@@ -328,8 +379,10 @@ def model(records, companions, scenario=LOCAL):
 
 
 def point(value, extra, scenario=LOCAL):
-    """Summarize one record per file set exactly as its history point is plotted."""
-    return _points(value, extra, scenario)[0] if value["benchmark_valid"] else {}
+    """Summarize one record per file set exactly as its history point is plotted, among the file sets of its own generation."""
+    if not value["benchmark_valid"]:
+        return {}
+    return _points(value, extra, scenario, generation({value["run_key"]: value}))[0]
 
 
 def rounded(value):
@@ -623,7 +676,7 @@ def _file_set(case, points, scenario):
     return html + "</tbody></table></div></details></section>"
 
 
-def _render(cases, outside, limit, unmeasured, scenario, several):
+def _render(cases, outside, limit, unmeasured, scenario, several, sets, earlier):
     html = "<section id='history' aria-label='Performance history'>"
     html += "".join(_file_set(case, points, scenario) for case, points in cases.items() if points)
     empty = [NAMES[case] for case in unmeasured]
@@ -634,23 +687,32 @@ def _render(cases, outside, limit, unmeasured, scenario, several):
     if limit is not None:
         html += _window(limit, "<a href='index.html#runs'>list of runs</a>")
     # only a tool leaves file sets of the arrays out: a kind of copy plots every set of its storage
-    left_out = [case for case in CASES if case not in plotted(scenario)] if scenario in TOOLS else []
+    left_out = [case for case in sets.cases if case not in plotted(scenario, sets)] if scenario in TOOLS else []
     if left_out:
-        html += _left_out(scenario, left_out)
+        html += _left_out(scenario, left_out, sets)
     if outside:
         html += ("<p class='window'>" + plural(outside, "qualified measurement is", "qualified measurements are") +
                  " outside these trends (reference builds, other variants, scenarios or file sets); "
                  "see the run pages.</p>")
+    if earlier:
+        # the trends that ended when the file sets were replaced: kept, and out of the way
+        html += ("<details class='earlier'><summary>Earlier file sets</summary><p class='window'>These file sets were "
+                 "measured until the weekly suite replaced them with smaller ones, so that a command takes one to "
+                 "five minutes. Their numbers are not comparable with those above.</p>" +
+                 "".join(_file_set(case, points, scenario) for case, points in earlier.items()) + "</details>")
     return html + "</section>"
 
 
-def _left_out(scenario, cases):
+def _left_out(scenario, cases, sets):
     """Say which file sets a tool's page does not plot, and why: there the tool takes no measurable time."""
+    if not sets.timed:
+        return ("<p class='window'>" + scenario + " is timed on the sets of 1 KB files. It takes as long as its files "
+                "are many, and the sets of larger files have too few for a run of a minute.</p>")
     counts = []
     for case in cases:
-        shape = diagnostics.CASE_SHAPES[case]
+        shape = diagnostics.MATRIX_CASE_SHAPES[case]
         counts.append(f"{math.prod(shape['directory_widths']) * shape['files_per_leaf']:,}" +
-                      (" files" if not counts else "") + " of the " + CASES[case].replace(" files", "") + " set")
+                      (" files" if not counts else "") + " of the " + sets.cases[case].replace(" files", "") + " set")
     return ("<p class='window'>" + scenario + " is timed on every file set, but on the " + " and the ".join(counts) +
             " it takes milliseconds: those runs are on the run pages and are not plotted.</p>")
 
@@ -691,12 +753,17 @@ def render(records, companions, scenario=LOCAL):
 
     The inventory and frozen records stay unbounded by this.
     """
-    cases, outside = model(records, companions, scenario)
+    sets = generation(records)
+    cases, outside = model(records, companions, scenario, sets)
     # a file set is unmeasured only when no run ever measured it, whatever the plots show
     unmeasured = [case for case, points in cases.items() if not points]
     several = scenario != LOCAL or len(present(records)) > 1
-    return _fit({scenario: cases}, lambda windows, limit: _render(
-        windows[scenario], outside, limit, unmeasured, scenario, several))
+    # the file sets of the generations before, where this scenario has runs of them
+    earlier = {case: points for old in GENERATIONS[:GENERATIONS.index(sets)]
+               for case, points in model(records, companions, scenario, old)[0].items()
+               if points and case not in cases}
+    return _fit({scenario: cases, EARLIER: earlier}, lambda windows, limit: _render(
+        windows[scenario], outside, limit, unmeasured, scenario, several, sets, windows[EARLIER]))
 
 
 def _tile(case, points, scenario, page, beside, row=None):
@@ -727,28 +794,29 @@ def _tile(case, points, scenario, page, beside, row=None):
                   opening=opening, notes=notes)
 
 
-def _tool_tile(scenario, points):
+def _tool_tile(scenario, points, most_files):
     """One tool's duration on the file set with the most files, leading to that tool's page."""
     title, page, _ = ROWS[scenario]
-    link = ("<a href='" + page + "#history-" + MOST_FILES + "' aria-label='" + title + ", " + CASES[MOST_FILES] +
+    link = ("<a href='" + page + "#history-" + most_files + "' aria-label='" + title + ", " + NAMES[most_files] +
             "'>" + title + "</a>")
-    opening = _opening("overview-" + scenario + "-" + MOST_FILES, "data-overview='" + scenario + "'",
+    opening = _opening("overview-" + scenario + "-" + most_files, "data-overview='" + scenario + "'",
                        link if points else title, "overview-tools-title")
     if not points:
         # the tile keeps its place, so that the row always names the same tools in the same order
         return opening + "</figcaption><p class='delta'>No qualified run yet.</p></figure>"
-    return _panel(MOST_FILES, points, "duration", title + ", duration", "s", frame=COMPACT, opening=opening)
+    return _panel(most_files, points, "duration", title + ", duration", "s", frame=COMPACT, opening=opening)
 
 
-def _tools_row(windows):
+def _tools_row(windows, most_files):
     """The row of the other tools: each on the one file set where it has the most to do."""
-    shape = diagnostics.CASE_SHAPES[MOST_FILES]
+    shape = diagnostics.MATRIX_CASE_SHAPES[most_files]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
     return ("<section id='overview-tools' aria-labelledby='overview-tools-title'>"
             "<div class='overview-title'><h2 id='overview-tools-title'>Other tools</h2><span>" +
             f"{files:,} files of {_decimal(shape['file_size_bytes'])}, after each copy" + "</span></div>"
             "<div class='overview'>" + "".join(
-                _tool_tile(scenario, windows[scenario][MOST_FILES]) for scenario in TOOLS if scenario in windows) +
+                _tool_tile(scenario, windows[scenario][most_files], most_files)
+                for scenario in TOOLS if scenario in windows) +
             "</div></section>")
 
 
@@ -763,7 +831,7 @@ def _storage_row(windows):
             "<div class='overview'>" + tiles + "</div></section>")
 
 
-def _overview(windows, limit, several, local):
+def _overview(windows, limit, several, local, most_files):
     html = "<section id='history' aria-label='Copy duration of every file set'>"
     for scenario, cases in windows.items():
         if scenario in (NFS, MEMORY, *TOOLS):
@@ -787,7 +855,7 @@ def _overview(windows, limit, several, local):
         html += _storage_row(windows)
     tools = any(scenario in TOOLS for scenario in windows)
     if tools:
-        html += _tools_row(windows)
+        html += _tools_row(windows, most_files)
     if any(points for cases in windows.values() for points in cases.values()):
         html += ("<p class='reading'>Each point is one run: the median of its copies" +
                  (" or of a tool's runs" if tools else "") + ", with a bar from the fastest "
@@ -808,22 +876,25 @@ def overview(records, companions):
     """
     shown = present(records)
     several = len(shown) > 1
-    models = {scenario: model(records, companions, scenario)[0] for scenario in shown if scenario not in TOOLS}
+    # the file sets of the current generation only: the ones before them are on the page of each scenario
+    sets = generation(records)
+    models = {scenario: model(records, companions, scenario, sets)[0] for scenario in shown if scenario not in TOOLS}
     # the other tools appear with the first run that has a cell of one, on the file set with the most files
-    models.update({scenario: {MOST_FILES: model(records, companions, scenario)[0][MOST_FILES]}
+    models.update({scenario: {sets.most_files: model(records, companions, scenario, sets)[0][sets.most_files]}
                    for scenario in shown if scenario in TOOLS})
     # a remote plot is compared with the local copy of its own run, whether or not that copy is still plotted
-    return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL]))
+    return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL], sets.most_files))
 
 
-def storage_html(run, href, rows):
+def storage_html(run, href, rows, sets):
     """Tabulate what the arrays and the processors did during one run's copies, in the order of the trends.
 
-    `rows` are those of `diagnostics.storage_use`; file sets without a trend are left out, and so is
-    the whole table when nothing is left.
+    `rows` are those of `diagnostics.storage_use`. Only the file sets of the arrays in `sets`, the
+    generation that the page describes, have a row: a run on other file sets has no table.
     """
-    rows = sorted((row for row in rows if row["case_id"] in CASES and row["scenario"] in SCENARIOS),
-                  key=lambda row: (list(CASES).index(row["case_id"]), list(SCENARIOS).index(row["scenario"])))
+    order = list(sets.cases)
+    rows = sorted((row for row in rows if row["case_id"] in sets.cases and row["scenario"] in SCENARIOS),
+                  key=lambda row: (order.index(row["case_id"]), list(SCENARIOS).index(row["scenario"])))
     if not rows:
         return ""
     rate = lambda value: "unavailable" if value is None else f"{value / 10 ** 9:.2f} GB/s"
@@ -839,7 +910,7 @@ def storage_html(run, href, rows):
             "<th>Written to the destination</th><th>Destination busy</th><th>Read from the source</th>"
             "<th>Source busy</th><th>CPU busy</th></tr></thead><tbody>")
     for row in rows:
-        cells = (CASES[row["case_id"]], SCENARIOS[row["scenario"]], rate(row["written"]),
+        cells = (NAMES[row["case_id"]], SCENARIOS[row["scenario"]], rate(row["written"]),
                  share(row["destination_busy"]), rate(row["read"]), share(row["source_busy"]), share(row["cpu"]))
         html += "<tr>" + "".join("<td>" + escape(cell) + "</td>" for cell in cells) + "</tr>"
     return (html + "</tbody></table></div><p class='reading'>The figures come from the kernel's counters for "
@@ -850,10 +921,11 @@ def storage_html(run, href, rows):
             "was neither idle nor waiting for I/O.</p>")
 
 
-def reading_html(remote=False, tools=False):
+def reading_html(remote=False, tools=False, sized=False):
     """Explain once how points, lines and gaps are derived.
 
-    `remote` when remote copies have a page, `tools` when the other tools have theirs.
+    `remote` when remote copies have a page, `tools` when the other tools have theirs, and `sized`
+    when the pages show the file sets of the weekly suite.
     """
     other = ("" if not tools else
         "<li><strong>Other tools.</strong> A run can also time <code>rcmp</code>, <code>rlink</code> and "
@@ -862,8 +934,9 @@ def reading_html(remote=False, tools=False):
             '<a href="' + ROWS[tool][1] + '">' + tool + "</a>" for tool in TOOLS) + "), where a point is the median "
         "of the tool's runs in one benchmark run: three after the local copies of a file set and, when the run's "
         "suite has them, three after its remote copies. CPU time and peak memory are the tool's own. The AWS "
-        "benchmarks page shows each tool on the file set with the most files. A tool's page leaves out the file "
-        "sets on which it takes milliseconds.</li>")
+        "benchmarks page shows each tool on the file set with the most files. " + (
+            "The tools are timed on the sets of 1 KB files only: a tool takes as long as its files are many."
+            if sized else "A tool's page leaves out the file sets on which it takes milliseconds.") + "</li>")
     scope = (
         "<li><strong>Scope.</strong> The plots show local copies on one host. The AWS benchmarks page shows "
         'the copy duration of every file set; <a href="local.html">Local copies</a> adds CPU time, peak memory '
@@ -900,7 +973,9 @@ def reading_html(remote=False, tools=False):
         "<li><strong>Value axis.</strong> Fitted to the data and never narrower than 5% either side of its "
         "centre, so it does not start at zero and small run-to-run noise stays flat.</li>"
         "<li><strong>Copy duration.</strong> Copy wall time. Fixture generation, cache preparation, validation "
-        "and cleanup are outside it. For the terabyte file sets it cannot be shorter than the destination array "
+        "and cleanup are outside it. For the " + (
+            "sets of 1 GB, 100 MB and 1 MB files" if sized else "terabyte file sets") +
+        " it cannot be shorter than the destination array "
         "allows: see <a href='#storage'>What the storage allows</a>.</li>"
         "<li><strong>CPU time.</strong> User plus system seconds, added for each copy before the median is "
         "taken; not a sum of repetitions.</li>"

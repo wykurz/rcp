@@ -373,6 +373,9 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
     navigation = lambda route: aws_navigation(route, status=status, remote=remote, others=[
         production_history.ROWS[other][:2] for other in others], tools=[
         production_history.ROWS[tool][:2] for tool in tools])
+    # the file sets that the pages show as the current ones: those of the weekly suite, once a run of it has
+    # measured something
+    file_sets = production_history.generation(normalized)
     for run_key, raw in sorted(records.items(), key=lambda item: int(item[0].rsplit('-', 1)[1]), reverse=True):
         value = normalized[run_key]
         identity = value['identity']
@@ -384,10 +387,11 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         production_export.resource_diagnostics.validate(extra, value)
         if extra['setup'] is not None:
             observed.append(dict(run=identity['run'], href='runs/' + run_key + '.html', setup=extra['setup']))
-        # runs come newest first: the first with figures of its arrays is the one the setup page shows
+        # runs come newest first: the first with figures of its arrays for the current file sets is the
+        # one the setup page shows
         storage = storage or production_history.storage_html(
             identity['run'], 'runs/' + run_key + '.html',
-            production_export.resource_diagnostics.storage_use(extra, value))
+            production_export.resource_diagnostics.storage_use(extra, value), file_sets)
         pages[Path('aws-benchmarks/diagnostics') / (run_key + '.json')] = (
             production_export.collection.encoded(extra).decode('utf-8'))
         body = production_export.render(value, diagnostics=extra) + (
@@ -414,8 +418,10 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         'datasets below and one of two methods, so they are described here once. What an individual run '
         "observed is in that run's appendix and its diagnostics JSON.</p>" +
         production_export.resource_diagnostics.configuration_html(
-            observed[::-1], remote=remote, tools=bool(tools), elsewhere=bool(others), storage=storage) +
-        production_history.reading_html(remote, bool(tools)))
+            observed[::-1], remote=remote, tools=bool(tools), elsewhere=bool(others),
+            sized=file_sets is not production_history.GENERATIONS[0], storage=storage) +
+        production_history.reading_html(
+            remote, bool(tools), sized=file_sets is not production_history.GENERATIONS[0]))
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:
         raise ValueError('Central AWS setup page exceeds public HTML bound')
     pages[setup] = aws_page(setup, 'Test setup · AWS benchmarks', setup_content, navigation(setup) + [
