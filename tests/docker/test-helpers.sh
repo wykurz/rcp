@@ -104,10 +104,12 @@ setup_project() { # $1 = setup mode (reuse/rebuild)
     if [[ "$mode" == rebuild ]]; then
         compose_for_target "$target" down
         compose_for_target "$target" build --no-cache
+        build_payload "$target"
+        start "$target"
+    else
+        build_payload "$target"
+        start "$target" --build
     fi
-
-    build_payload "$target"
-    start "$target"
 }
 
 setup() {
@@ -237,11 +239,12 @@ probe_ssh_until() {
 }
 
 # Start containers
-start() { # $1 = resolved target
+start() { # $1 = resolved target, remaining arguments = extra `compose up` flags (e.g. --build)
     local target="$1"
+    shift
     info "Starting Docker containers..."
     compose_for_target "$target" config --quiet
-    compose_for_target "$target" up -d
+    compose_for_target "$target" up -d "$@"
 
     # wait for SSH to be ready
     info "Waiting for SSH servers to start..."
