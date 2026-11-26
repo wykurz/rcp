@@ -502,7 +502,7 @@ assert_contains "$RCP_DOCKER_TEST_CARGO_LOG" \
 assert_contains "$RCP_DOCKER_TEST_COMPOSE_LOG" \
     'aarch64-unknown-linux-musl|config --quiet'
 assert_contains "$RCP_DOCKER_TEST_COMPOSE_LOG" \
-    'aarch64-unknown-linux-musl|up -d'
+    'aarch64-unknown-linux-musl|up -d --build'
 assert_not_contains "$RCP_DOCKER_TEST_COMPOSE_LOG" 'x86_64-unknown-linux-musl|'
 assert_contains "$RCP_DOCKER_TEST_DOCKER_LOG" \
     $'CALL\texec\t-u\ttestuser\trcp-test-master\tssh\t-o\tBatchMode=yes\t-o\tConnectTimeout=5\thost-a\thostname'
