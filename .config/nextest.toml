@@ -4,6 +4,8 @@
 [profile.default]
 # allow most tests to run in parallel
 test-threads = 32
+# show failure output both immediately and again in the final summary so unattended runs stay readable
+failure-output = "immediate-final"
 
 [test-groups]
 # serialize the homogeneous rcp SSH target and the remote crate's real-session SSH module

@@ -38,4 +38,11 @@ if [ "${1:-}" = --print-target ]; then
     exit 0
 fi
 
+# cargo-nextest's interactive progress bar (`indicatif`) suppresses status and
+# failure lines on `TERM=dumb` PTYs (common in agent runners, Emacs, and CI).
+# Default to counter progress there unless the caller already chose a mode.
+if [ "${1:-}" = nextest ] && [ "${TERM:-}" = dumb ] && [ -z "${NEXTEST_SHOW_PROGRESS:-}" ]; then
+    export NEXTEST_SHOW_PROGRESS=counter
+fi
+
 exec "$CARGO_BIN" "$@"
