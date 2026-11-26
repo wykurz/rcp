@@ -70,6 +70,7 @@ on:
           - matrix-commission-memory+tools
           - matrix-all-local+tools+remote+tools+nfs+tools+memory+tools
           - matrix-commission-local+tools+remote+tools+nfs+tools+memory+tools
+          - matrix-weekly-1
         default: bulk-1g-metadata
         required: true
       revision:
