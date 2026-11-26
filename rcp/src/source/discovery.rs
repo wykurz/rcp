@@ -652,6 +652,20 @@ async fn file_job(
     obligated(obligation, async {
         let observation = &job.observation;
         if let Some(readiness) = &job.readiness {
+            #[cfg(test)]
+            let state = {
+                let mut wait = std::pin::pin!(readiness.wait());
+                match futures::poll!(wait.as_mut()) {
+                    std::task::Poll::Ready(state) => state,
+                    std::task::Poll::Pending => {
+                        context
+                            .checkpoint("wait_ready", &observation.pair.src, 0)
+                            .await?;
+                        wait.await
+                    }
+                }
+            };
+            #[cfg(not(test))]
             let state = readiness.wait().await;
             match state {
                 ReadyState::Rejected => return Ok(()),
@@ -1347,6 +1361,7 @@ pub(super) async fn run(
 
 #[cfg(test)]
 mod tests {
+    mod trace_teardown;
     use super::*;
     /// How long a test waits for a discovery run that must end before it reports a hang.
     ///
