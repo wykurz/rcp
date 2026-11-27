@@ -635,11 +635,14 @@ fn is_peer_closure(error: &anyhow::Error) -> bool {
 /// A FIXED message (never the transport error) so `ErrorCollector` dedups several concurrent
 /// truncations to one cause and cannot mask a real error; the transport kind is logged at the call
 /// site.
-fn truncated_stream_error() -> anyhow::Error {
-    anyhow::anyhow!(
-        "data stream closed before the transfer completed (truncated header or dropped link)"
-    )
-}
+///
+/// A type of its own because the collector it is recorded in also holds this side's own failures,
+/// and this is not one of them: it is how the far end going away reads on a data stream. The same
+/// event ends the control stream, in no guaranteed order, and whether a worker gets to record this
+/// first must not change what the destination makes of the event.
+#[derive(Debug, thiserror::Error)]
+#[error("data stream closed before the transfer completed (truncated header or dropped link)")]
+struct TruncatedDataStream;
 
 /// Handle a stream that may contain multiple files.
 ///
@@ -674,7 +677,7 @@ async fn handle_file_stream(
                 // the SAME completion gate as a transport-level closure — see `peer_close_is_benign`.
                 if !peer_close_is_benign(&directory_tracker) {
                     tracing::error!("Data stream closed cleanly before the transfer completed");
-                    return Err(truncated_stream_error());
+                    return Err(TruncatedDataStream.into());
                 }
                 tracing::debug!("Stream closed, no more files");
                 break;
@@ -703,7 +706,7 @@ async fn handle_file_stream(
                     tracing::error!(
                         "Data stream closed before the transfer completed (truncation): {e:#}"
                     );
-                    return Err(truncated_stream_error());
+                    return Err(TruncatedDataStream.into());
                 }
                 // A framing/decode fault — an oversized length prefix (`InvalidData`), a TLS protocol
                 // fault, or a frame that does not decode to a `File` — is always fatal.
@@ -2424,7 +2427,11 @@ pub async fn run_destination(
         // (both futures done). Logical completion and a successfully sent Done must both hold.
         let completed = directory_tracker.with_state(|state| state.transfer_complete());
         let recorded = error_collector.take_error();
-        let had_recorded_error = recorded.is_some();
+        // a truncated data stream is the tunnel closing as seen by a worker, so it leaves the
+        // forwarding hint below standing: only a failure of this side's own rules the hint out
+        let had_own_error = recorded
+            .as_ref()
+            .is_some_and(|error| !error.is::<TruncatedDataStream>());
         let connect_cause = data_pool.shutdown.take_first_connect_error();
         let had_connect_cause = connect_cause.is_some();
         let result = choose_final_result(
@@ -2442,7 +2449,7 @@ pub async fn run_destination(
                         && !peer_connected.load(std::sync::atomic::Ordering::Acquire))
                         || had_connect_cause)
                     && !completed
-                    && !had_recorded_error
+                    && !had_own_error
                     && summary.files_copied == 0
                     && summary.directories_created == 0
                     && summary.symlinks_created == 0
@@ -6443,5 +6450,152 @@ mod ssh_transport_tests {
             let _ = writer.await;
         }
         cleanup.finish();
+    }
+
+    /// How a tunnel whose far end is not the source looks from the destination.
+    #[derive(Clone, Copy, Debug)]
+    enum DeadTunnel {
+        /// Both connections close without a byte, the control connection first.
+        ClosesControlFirst,
+        /// Both connections close without a byte, the data connection first.
+        ClosesDataFirst,
+        /// The data connection carries bytes that are no frame of this protocol.
+        AnswersWithNoise,
+    }
+
+    /// Run a plaintext destination against a listener pair that accepts its connections and then
+    /// does what `tunnel` says, which is all a destination sees of a local `-L` listener whose far
+    /// end is not the source. Returns the destination's result and whether it took the peer for
+    /// connected.
+    async fn run_destination_against_dead_tunnel(
+        tunnel: DeadTunnel,
+    ) -> (anyhow::Result<(String, common::copy::Summary)>, bool) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let concurrency = remote::resolve_remote_concurrency(
+            common::ConcurrencyLimit::Limited(std::num::NonZeroUsize::new(1).unwrap()),
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap();
+        let tcp = remote::TcpConfig {
+            keepalive_sec: 0,
+            conn_timeout_sec: 5,
+            ..Default::default()
+        };
+        let cleanup = remote::RemoteCleanup::new().unwrap();
+        let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        let data_addr = data_listener.local_addr().unwrap();
+        let tcp_for_tunnel = tcp.clone();
+        let fake_tunnel = tokio::spawn(async move {
+            let (control, _) = remote::accept_tcp_control(&control_listener, &tcp_for_tunnel)
+                .await
+                .unwrap();
+            let (mut data, _) = remote::accept_tcp_data(
+                &data_listener,
+                tcp_for_tunnel.network_profile,
+                tcp_for_tunnel.keepalive_sec,
+            )
+            .await
+            .unwrap();
+            let (mut control_read, mut control_write) = control.into_split();
+            // the destination closes its control send side only as it tears down, so the end of
+            // that stream is how this side knows that the first closure has been acted on
+            let mut sent_by_destination = Vec::new();
+            match tunnel {
+                DeadTunnel::ClosesControlFirst => {
+                    control_write.shutdown().await.unwrap();
+                    let _ = control_read.read_to_end(&mut sent_by_destination).await;
+                    drop(data);
+                }
+                DeadTunnel::ClosesDataFirst => {
+                    drop(data);
+                    let _ = control_read.read_to_end(&mut sent_by_destination).await;
+                }
+                DeadTunnel::AnswersWithNoise => {
+                    // a length prefix that no frame may have
+                    data.write_all(&[0xff; 4]).await.unwrap();
+                    let _ = control_read.read_to_end(&mut sent_by_destination).await;
+                }
+            }
+        });
+        let (control_tx, control_rx) = remote::stdio::daemon_control_channel();
+        let (_tracing_tx, tracing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (daemon_write, _master_read) = tokio::io::duplex(4096);
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer = tokio::spawn(remote::stdio::run_daemon_stdout_writer(
+            control_rx,
+            tracing_rx,
+            remote::streams::SendStream::new(daemon_write),
+            writer_shutdown.clone(),
+        ));
+        let peer_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_destination(
+                &control_addr,
+                &[data_addr],
+                "test-source",
+                &testutils::copy_settings(),
+                false,
+                0,
+                &common::preserve::preserve_none(),
+                &tcp,
+                concurrency,
+                common::EndpointAdmission::Disabled,
+                None,
+                &remote::protocol::PeerAuth::None,
+                &remote::protocol::DestinationTransport::MasterSshTunnel,
+                &control_tx,
+                None,
+                &cleanup,
+                &peer_connected,
+            ),
+        )
+        .await
+        .expect("the destination must end once the tunnel has closed");
+        tokio::time::timeout(std::time::Duration::from_secs(20), fake_tunnel)
+            .await
+            .expect("the tunnel must see the destination close its control stream")
+            .unwrap();
+        drop(control_tx);
+        writer_shutdown.cancel();
+        let _ = writer.await;
+        cleanup.finish();
+        (
+            result,
+            peer_connected.load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    #[tokio::test]
+    async fn dead_plaintext_tunnel_gets_the_forwarding_hint_whichever_stream_closes_first() {
+        for tunnel in [DeadTunnel::ClosesControlFirst, DeadTunnel::ClosesDataFirst] {
+            let (result, peer_connected) = run_destination_against_dead_tunnel(tunnel).await;
+            let error = result.expect_err("a tunnel that carried nothing fails the copy");
+            assert!(
+                !peer_connected,
+                "{tunnel:?}: no frame arrived from the source"
+            );
+            assert!(
+                format!("{error:#}").contains("verify `AllowTcpForwarding` in sshd_config"),
+                "{tunnel:?}: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_on_a_plaintext_tunnel_is_not_blamed_on_forwarding() {
+        let (result, peer_connected) =
+            run_destination_against_dead_tunnel(DeadTunnel::AnswersWithNoise).await;
+        let error = result.expect_err("a stream that is not the source's fails the copy");
+        assert!(!peer_connected, "no frame arrived from the source");
+        let report = format!("{error:#}");
+        assert!(
+            report.contains("transport or decode fault reading file header"),
+            "{report}"
+        );
+        assert!(!report.contains("AllowTcpForwarding"), "{report}");
     }
 }
