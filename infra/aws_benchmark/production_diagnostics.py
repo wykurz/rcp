@@ -1109,6 +1109,60 @@ def storage_use(value, record):
     return rows
 
 
+# the phases in which the paired harness checks a file set or a copy
+_CHECKS = frozenset({"initial_verification", "destination", "metadata", "source"})
+
+
+def time_use(value, record):
+    """Where the time of one run went, in seconds: by kind of work and, for a matrix run, by file set.
+
+    A phase lasts from the moment the harness marks it to its next mark, so the phases of a run cover
+    its harness from the first mark to the end and no second is counted twice. `commands` holds the
+    commands the run times, by the trend each belongs to: a kind of copy, or a tool whichever copies
+    it followed. `around` holds what happens between them: generating a file set, emptying the page
+    cache, removing a copy, removing the tree rlink made (`links`), removing a file set and what was
+    left of its copies, the checks of the paired harness, and every other step. A file set has its
+    commands, its generation and the rest; what belongs to no file set is in the total alone.
+
+    None for a run that marked no phase. A run is not `complete` when a command of it recorded none,
+    or the steps outside its commands did not: it took longer than its total.
+    """
+    tool_cells = _tool_cells(value["schema"])
+    order = [case["case_id"] for case in value["cases"]]
+    commands, around, cases = {}, {}, {}
+
+    def count(group, kind, seconds, case, part):
+        group[kind] = group.get(kind, 0) + seconds
+        if case is not None:
+            cases.setdefault(case, dict(case_id=case, commands=0, generation=0, rest=0))[part] += seconds
+
+    system = value["system"]
+    for phase in system["phases"] if system is not None else ():
+        index = phase["case_index"]
+        kind = {"generation": "generation", "cleanup": "file_sets"}.get(
+            phase["phase"], "checks" if phase["phase"] in _CHECKS else "other")
+        count(around, kind, phase["elapsed_seconds"], order[index] if index is not None and index < len(order) else None,
+              "generation" if kind == "generation" else "rest")
+    for trial in value["trials"]:
+        scenario = trial.get("scenario", LOCAL)
+        tool = tool_cells[scenario][0] if scenario in tool_cells else None
+        for phase in trial["system"]["phases"]:
+            name = phase["phase"]
+            if name == "command":
+                count(commands, tool or scenario, phase["elapsed_seconds"], trial["case_id"], "commands")
+                continue
+            kind = ("cache" if name == "cache" else ("links" if tool == "rlink" else "copies") if name == "cleanup" else
+                    "checks" if name in _CHECKS else "other")
+            count(around, kind, phase["elapsed_seconds"], trial["case_id"], "rest")
+    if not commands and not around:
+        return None
+    return dict(total=sum(commands.values()) + sum(around.values()), commands=commands, around=around,
+                # the paired harness numbers its file sets as it was given them, not as a page lists them
+                cases=[cases[case] for case in order if case in cases] if _matrix(record) else [],
+                complete=bool(system is not None and system["phases"]) and
+                         all(trial["system"]["phases"] for trial in value["trials"]))
+
+
 def _unit(value, unit, divisor=1):
     return "unavailable" if value is None else f"{value / divisor:,.3f} {unit}"
 

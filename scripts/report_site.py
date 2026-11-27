@@ -405,13 +405,18 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
              '<li>Worker evidence (not public): ' + production_export.evidence_html(value) + '.</li>') +
             '</ul>' + retention + '</section>')
         name = 'Run ' + identity['run']
+        # where the run's time went has a section on its page, and its total a place in the list of runs
+        use = production_export.resource_diagnostics.time_use(extra, value)
         pages[report] = aws_page(report, name + ' · AWS benchmarks', body, navigation(report) + [
             aws_link(name, '#report-content', current=True), aws_link('Results', '#results', nested=True),
+            *([aws_link('Where the time went', '#time-use', nested=True)] if use else []),
             aws_link('Resource diagnostics', '#resource-diagnostics', nested=True),
             aws_link('Observed setup', '#observed-setup', nested=True), aws_link('Raw data', '#raw-data', nested=True)])
         rows.append('<tr><td><a href="runs/' + run_key + '.html">' + html.escape(identity['run']) + '</a></td><td>' +
                     production_export.badge(value) + '</td><td><code>' + html.escape(identity['suite']) +
                     '</code></td><td>' + production_export.commit_html(identity, identity['candidate']) +
+                    '</td><td>' + ('<a href="runs/' + run_key + '.html#time-use">' +
+                                   production_history.span(use['total']) + '</a>' if use else '—') +
                     '</td><td>' + production_export.collected_html(value) + '</td></tr>')
     setup_content = (
         '<h1>Test setup</h1><p class="lede">Every run uses the same machine type and storage layout, the '
@@ -439,7 +444,8 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             'stay listed and are excluded from the plots. These records are separate from historical Depot '
             'measurements.</p><div class="table-scroll"><table class="data"><thead><tr><th>Run</th><th>Result</th>'
             '<th>Suite</th>'
-            '<th>Commit</th><th>Collected</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>'
+            '<th>Commit</th><th>Took</th><th>Collected</th></tr></thead><tbody>' + ''.join(rows) +
+            '</tbody></table></div>'
             if rows else '<p>' + html.escape(empty or 'No public records are listed.') + '</p>')
     # the first page shows every trend at once, as copy duration; a run covers every kind of copy, so the
     # list of runs is here too
