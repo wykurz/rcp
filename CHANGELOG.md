@@ -74,6 +74,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   switched off (`net.ipv4.tcp_moderate_rcvbuf=0`) and receive buffers are left at their small
   starting size, encrypted copies took 4% to 12% longer on kernels 6.6 and later. The README's "TCP
   Socket Buffers" section explains both limits and says how to give such a host larger buffers.
+- Report both `rcpd` when one of them dies during a remote copy. `rcp` used to report whichever it
+  heard from first: the daemon that died, or only the other daemon's account of it. It now names
+  both, source first, after giving the survivor two seconds to say what it saw.
 
 ### Changed
 
