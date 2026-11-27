@@ -72,6 +72,8 @@ on:
           - matrix-commission-local+tools+remote+tools+nfs+tools+memory+tools
           - matrix-weekly-1
           - matrix-weekly-2
+          - matrix-reference-1
+          - matrix-commission-reference
         default: bulk-1g-metadata
         required: true
       revision:

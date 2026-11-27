@@ -77,8 +77,9 @@ class WeeklySuiteTests(unittest.TestCase):
         self.assertEqual(sizes, [1_000_000_000, 1_000_000, 1000, 1000, 1000])
 
     def test_it_follows_the_suites_there_were(self):
-        self.assertEqual(common.DURABLE_SUITES[47:], (FIRST, WEEKLY))
-        self.assertEqual(len(common.MATRIX_SUITES), 44)
+        self.assertEqual(common.DURABLE_SUITES[47:49], (FIRST, WEEKLY))
+        # the suites with reference cells follow (test_reference_cells.py)
+        self.assertEqual(len(common.MATRIX_SUITES), 46)
         self.assertEqual(common.MATRIX_WEEKLY, WEEKLY)
         # its cells never change: another choice of file sets or scenarios is another suite, with the next number
         self.assertRegex(WEEKLY, r"^matrix-weekly-[1-9][0-9]*$")

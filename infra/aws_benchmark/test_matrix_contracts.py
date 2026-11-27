@@ -34,7 +34,7 @@ class MatrixContractTests(unittest.TestCase):
         self.assertEqual(common.DURABLE_SUITES[5:11], (
             "matrix-all-local", "matrix-1g-local", "matrix-100m-local", "matrix-1m-local", "matrix-1k-local",
             "matrix-commission-local"))
-        self.assertEqual(len(common.DURABLE_SUITES), 49)
+        self.assertEqual(len(common.DURABLE_SUITES), 51)
         self.assertEqual(common.MATRIX_SUITES["matrix-1m-local"], (("bulk-1m-1024gb", "local"),))
         self.assertEqual(common.MATRIX_SUITES["matrix-commission-local"],
                          (("commission-64m", "local"), ("commission-10k", "local")))

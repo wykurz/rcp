@@ -44,6 +44,15 @@ def matrix_storage(scenario):
 
 # the scenarios of their cells: a tool cell is named after the copies it follows and its tool
 MATRIX_TOOL_CELLS = frozenset(copies + "-" + tool for copies in MATRIX_STORAGE for tool in MATRIX_TOOLS)
+# the tools that copy a file set for reference, as the runner has them: what each runs, and the
+# copy cells that a cell of it can stand beside. cp copies between two directories of one host and
+# rsync also pulls from one. A reference cell is named after the cell beside it and its tool
+MATRIX_REFERENCES = MappingProxyType({"cp": ("cp-a", ("local", "nfs", "memory")),
+                                      "rsync": ("rsync-a", ("local", "remote", "nfs", "memory"))})
+MATRIX_REFERENCE_CELLS = MappingProxyType({
+    copies + "-" + tool: variant for tool, (variant, beside) in MATRIX_REFERENCES.items() for copies in beside})
+# how many times the median of rcp's copies a reference copy may take before it is cut off
+MATRIX_REFERENCE_LIMIT = 10
 # every binary that any plan may name: what an upload or a mailbox object can be
 KNOWN_BINARIES = tuple(f"{role}/{name}" for role in ("baseline", "candidate")
                        for name in (*BINARY_NAMES, *MATRIX_TOOLS))
@@ -216,6 +225,42 @@ for _suite, _cells in _WEEKLY_SUITES.items():
     _MATRIX_PROFILES[_suite] = dict(
         cases=tuple(dict.fromkeys(case for case, _ in _cells)), cells=_cells, repetitions=3, timeout=3600,
         purpose="performance", runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
+# what cp and rsync take for the copies of the weekly suite, measured once for reference: those
+# tools do not change from week to week. rcp copies each file set first, as in the weekly suite,
+# and then each of the two does. rcp's copies set the limit of theirs, ten times their median: a
+# copy that takes longer is cut off and reported as not finished, and its cell is not tried again.
+# The file sets are the weekly suite's, without the one in memory, and no other tool is timed. The
+# sets of small files come first: there the tools differ, where on large files every one of them
+# waits for the same array. About five to seven hours of work are expected. Should every copy of
+# cp and rsync end just inside its limit it would be fourteen, so the run has the longest
+# allocation there is, twelve hours with its reservation, and the bill follows the time it takes
+_REFERENCE_SUITES = {
+    "matrix-reference-1": (
+        *(("tiny-1k-2048k", scenario) for scenario in ("local", "local-cp", "local-rsync", "remote", "remote-rsync")),
+        *(("tiny-1k-700x1024", scenario) for scenario in ("nfs", "nfs-cp", "nfs-rsync")),
+        *((case, scenario) for case in ("bulk-1m-200gb", "bulk-1g-200gb")
+          for scenario in ("local", "local-cp", "local-rsync", "remote", "remote-rsync"))),
+    # the same cells on the small fixtures: every step of such a run in minutes
+    "matrix-commission-reference": (
+        *(("commission-64m", scenario) for scenario in ("local", "local-cp", "local-rsync", "remote", "remote-rsync")),
+        *(("commission-10k", scenario) for scenario in ("local", "local-cp", "local-rsync", "remote", "remote-rsync",
+                                                        "nfs", "nfs-cp", "nfs-rsync")))}
+MATRIX_REFERENCE_SUITES = tuple(_REFERENCE_SUITES)
+for _suite, _cells in _REFERENCE_SUITES.items():
+    _version = _suite + "-plan-v1"
+    _commissioning = "commission" in _suite
+    _base = _RECORDED_DURABLE_CONTRACTS[
+        "bulk-100m-qualification-budget-v1" if _commissioning else "all-filesets-qualification-budget-v1"]
+    _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+        _base, suite=_suite, timing_basis="fixed allocation; cells that do not fit are reported as not run",
+        **({} if _commissioning else dict(max_runtime=43200, runtime_profile=TOOLS_RUNTIME_PROFILE,
+                                          reservation_microusd=65_000_000)),
+        plan=MappingProxyType(dict(_base["plan"], version=_version, minimum_worker_seconds=3600))))
+    _MATRIX_PLAN_VERSIONS[_suite] = _version
+    _MATRIX_PROFILES[_suite] = dict(
+        cases=tuple(dict.fromkeys(case for case, _ in _cells)), cells=_cells, repetitions=3, timeout=3600,
+        purpose="commissioning" if _commissioning else "performance", reference_limit=MATRIX_REFERENCE_LIMIT,
+        runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
 _CURRENT_PLAN_VERSIONS = MappingProxyType({
     "bulk-1g-metadata": "bulk-metadata-plan-v1",
     "bulk-100m-metadata": "bulk-100m-qualification-budget-v1",
@@ -294,9 +339,13 @@ def matrix_contract(suite):
     """
     profile = SUITE_PROFILES[suite] if suite in MATRIX_SUITES else None
     require(profile is not None, "suite is not a benchmark matrix")
-    return dict(cells=profile["cells"], repetitions=profile["repetitions"], timeout=profile["timeout"],
-                purpose=profile["purpose"], cache_policy=PERFORMANCE_CONTRACT["cache_policy"],
-                runner_label=profile["runner_label"])
+    contract = dict(cells=profile["cells"], repetitions=profile["repetitions"], timeout=profile["timeout"],
+                    purpose=profile["purpose"], cache_policy=PERFORMANCE_CONTRACT["cache_policy"],
+                    runner_label=profile["runner_label"])
+    if "reference_limit" in profile:
+        # only a suite with reference cells has one: every other contract is what it was
+        contract["reference_limit"] = profile["reference_limit"]
+    return contract
 
 
 def verification_contracts(suite):

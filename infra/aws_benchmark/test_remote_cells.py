@@ -24,8 +24,10 @@ class RemoteCellWorkerTests(unittest.TestCase):
         for suite, cells in common.MATRIX_SUITES.items():
             with self.subTest(suite=suite):
                 remote = any(scenario == "remote" for _, scenario in cells)
-                # a suite of the catalog says so in its name; a weekly suite is named after what it is for
-                self.assertEqual(remote, "remote" in suite or suite in common.MATRIX_WEEKLY_SUITES)
+                # a suite of the catalog says so in its name; a weekly suite and one with reference
+                # cells are named after what they are for
+                self.assertEqual(remote, "remote" in suite or suite in (*common.MATRIX_WEEKLY_SUITES,
+                                                                        *common.MATRIX_REFERENCE_SUITES))
                 sandbox = properties(worker.command(dict(suite=suite, baseline="a" * 40), 25000))
                 # loopback only: the unit keeps its private network, and no netlink or IPv6
                 self.assertEqual(sandbox["RestrictAddressFamilies"], "AF_UNIX AF_INET" if remote else "AF_UNIX")

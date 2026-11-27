@@ -4,7 +4,8 @@ import copy
 import re
 
 from . import results
-from .common import MATRIX_SUITES, digest, durable_plan_contract, matrix_storage, require, timestamp
+from .common import (MATRIX_REFERENCE_CELLS, MATRIX_SUITES, digest, durable_plan_contract, matrix_storage, require,
+                     timestamp)
 from .json_bytes import encoded
 
 SCHEMA = "rcp-production-public-report-v1"
@@ -61,12 +62,31 @@ PUBLIC_CONTRACTS = {
                           for tool, variant in (("rcmp", "rcmp-size"), ("rlink", "rlink-default"),
                                                 ("rrm", "rrm-default"))},
     },
+    # a matrix run with reference cells: version 6 with seven more scenarios, in which cp or rsync
+    # copies a file set beside rcp's copy of it. Such a cell is named after the copy cell it
+    # stands beside and its tool, and its measurement names what that tool ran, as a tool cell's
+    # does. `reference_cells` says which cells these are. Neither tool reports what it copied
+    "rcp-production-public-report-v7": {
+        "validation": "Not verified: a copy or a tool run counts when its command exits cleanly and reports the "
+                      "expected counts. A copy by cp or rsync, which report none, counts when it exits cleanly.",
+        "series_contract": "aws-local-ext4-v1",
+        "verification": {"policy": "exit-status-summary-v1"},
+        "variant": "rcp-default",
+        "tool_variants": {
+            **{copies + "-" + tool: variant for copies in ("local", "remote", "nfs", "memory")
+               for tool, variant in (("rcmp", "rcmp-size"), ("rlink", "rlink-default"), ("rrm", "rrm-default"))},
+            "local-cp": "cp-a", "nfs-cp": "cp-a", "memory-cp": "cp-a", "local-rsync": "rsync-a",
+            "remote-rsync": "rsync-a", "nfs-rsync": "rsync-a", "memory-rsync": "rsync-a"},
+        "reference_cells": ("local-cp", "nfs-cp", "memory-cp", "local-rsync", "remote-rsync", "nfs-rsync",
+                            "memory-rsync"),
+    },
 }
 VALIDATION = PUBLIC_CONTRACTS[SCHEMA]["validation"]
 MATRIX_SCHEMA = "rcp-production-public-report-v4"
 TOOLS_SCHEMA = "rcp-production-public-report-v5"
 STORAGE_SCHEMA = "rcp-production-public-report-v6"
-MATRIX_SCHEMAS = (MATRIX_SCHEMA, TOOLS_SCHEMA, STORAGE_SCHEMA)
+REFERENCE_SCHEMA = "rcp-production-public-report-v7"
+MATRIX_SCHEMAS = (MATRIX_SCHEMA, TOOLS_SCHEMA, STORAGE_SCHEMA, REFERENCE_SCHEMA)
 CELL_OUTCOMES = ("complete", "failed", "timed_out", "interrupted", "not_run")
 MAX_CELLS = 64
 
@@ -99,6 +119,8 @@ def comparison_label(identity, controller):
 def matrix_schema(scenarios):
     """The version of a matrix run's record: fixed by the scenarios of its suite, never by its outcome."""
     scenarios = set(scenarios)
+    if scenarios & set(MATRIX_REFERENCE_CELLS):
+        return REFERENCE_SCHEMA
     if any(matrix_storage(scenario) != "disks" for scenario in scenarios):
         return STORAGE_SCHEMA
     return TOOLS_SCHEMA if scenarios & set(PUBLIC_CONTRACTS[TOOLS_SCHEMA]["tool_variants"]) else MATRIX_SCHEMA
@@ -154,8 +176,13 @@ def freeze(run_key, identity, pins, valid, evidence, raw, *, outcome=None, execu
             for cell in raw["cells"] if cell["outcome"]["status"] == "complete"]
         value["verification"] = evidence["expected_verification"]
         value["timestamp"] = raw["timestamp"]
+        # a version with tool cells speaks of tool runs. One that also has reference cells does
+        # when the run has a tool cell: a copy by cp or rsync is a copy
+        timed = set(contract.get("tool_variants", ())) - set(contract.get("reference_cells", ()))
+        tools = (any(cell["scenario"] in timed for cell in raw["cells"]) if "reference_cells" in contract
+                 else bool(timed))
         value["note"] = (f"Each measurement is the median of {raw['context']['repetitions']} copies" +
-                         (" or tool runs." if "tool_variants" in contract else "."))
+                         (" or tool runs." if tools else "."))
     elif valid:
         require(raw is not None and raw["status"] == "complete", "successful projection requires complete measurements")
         value["measurements"] = [{

@@ -37,9 +37,10 @@ class StorageTrendTests(unittest.TestCase):
                           "nfs-rrm": "Remove with rrm, after a copy between NFS mounts",
                           "memory-rcmp": "Compare with rcmp, after a copy in memory",
                           "remote-rrm": "Remove with rrm, after a remote copy"})
-        # every scenario that a suite can select has a name
+        # every scenario that a suite can select has a name; the cells in which another tool copies a
+        # file set get theirs with their place on the pages
         self.assertEqual(set(history.SCENARIOS), {scenario for cells in common.MATRIX_SUITES.values()
-                                                  for _, scenario in cells})
+                                                  for _, scenario in cells} - set(common.MATRIX_REFERENCE_CELLS))
         self.assertEqual(history.TOOL_CELLS, frozenset(tools(*COPIES)))
         # a trend is a kind of copy or a tool; a tool's trend takes its cells after every kind of copy
         self.assertEqual(history.TRENDS, (*COPIES, *TOOLS))
