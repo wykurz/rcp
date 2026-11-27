@@ -17,15 +17,21 @@ This document describes the security architecture of the rcp (remote copy) tool.
 
 The rcp remote copy system provides:
 
-1. **SSH** for authentication, authorization, rcpd deployment, and all Master↔rcpd control and
-   tracing traffic
-2. **TLS with certificate pinning** for encrypted and authenticated Source↔Destination data transfer
+1. **SSH** for authentication, authorization, rcpd deployment, all Master↔rcpd control and tracing
+   traffic, and wire encryption when using `--remote-transport=ssh` (or `auto` fallback)
+2. **TLS 1.3 with certificate pinning** for direct TCP Source↔Destination transfers, and **1-RTT
+   loopback mutual HMAC-SHA256** for SSH-tunneled (and `--remote-transport=ssh` same-host loopback)
+   transfers so data is not double-encrypted inside SSH
 
 Master↔rcpd control and tracing run inside the authenticated SSH exec channel (`stdin`/`stdout`), so
-daemons never open a master-facing TCP listener. Source↔Destination TCP connections are encrypted
-and mutually authenticated by default using TLS 1.3 with self-signed certificates and fingerprint
-pinning. Source and destination each generate an ephemeral certificate, report its fingerprint to
-the master over SSH `stderr`, and receive their peer's fingerprint from the master over SSH `stdin`.
+daemons never open a master-facing TCP listener. Direct Source↔Destination TCP connections are
+encrypted and mutually authenticated by default using TLS 1.3 with self-signed certificates and
+fingerprint pinning. Source and destination each generate an ephemeral certificate, report its
+fingerprint to the master over SSH `stderr`, and receive their peer's `PeerAuth` policy from the
+master over SSH `stdin`. When transferring over SSH tunnels, SSH encrypts the network wire while
+each loopback TCP hop is mutually authenticated with a per-session 256-bit HMAC-SHA256 secret
+(unless `--remote-transport=auto` is combined with an explicit non-loopback `--bind-ip`, which keeps
+mutual TLS 1.3 on SSH fallback).
 
 ## Architecture
 
@@ -54,12 +60,12 @@ tracing)│                             │ tracing)
 
 ### Communication Channels
 
-| Channel                                    | Protocol | Authentication             | Encryption |
-| ------------------------------------------ | -------- | -------------------------- | ---------- |
-| Master ↔ Source (spawn, control, tracing)  | SSH      | SSH keys/password          | SSH        |
-| Master ↔ Destination (spawn, control, ...) | SSH      | SSH keys/password          | SSH        |
-| Source ↔ Destination (control)             | TLS      | Mutual fingerprint pinning | TLS 1.3    |
-| Source → Destination (data)                | TLS      | Mutual fingerprint pinning | TLS 1.3    |
+| Channel                                    | Protocol | Authentication                          | Encryption |
+| ------------------------------------------ | -------- | --------------------------------------- | ---------- |
+| Master ↔ Source (spawn, control, tracing)  | SSH      | SSH keys/password                       | SSH        |
+| Master ↔ Destination (spawn, control, ...) | SSH      | SSH keys/password                       | SSH        |
+| Source ↔ Destination (direct TCP)          | TLS      | Mutual fingerprint pinning              | TLS 1.3    |
+| Source ↔ Destination (SSH tunnel)          | SSH+HMAC | SSH + 1-RTT loopback mutual HMAC-SHA256 | SSH        |
 
 ## TLS Certificate Authentication
 
@@ -110,12 +116,12 @@ Source creates TLS server, destination connects with client cert:
 
 ### Security Properties
 
-| Property            | Guarantee                                                |
-| ------------------- | -------------------------------------------------------- |
-| **Confidentiality** | SSH for Master↔rcpd; AES-256-GCM or ChaCha20-Poly1305    |
-| **Integrity**       | SSH MAC/AEAD and TLS AEAD                                |
-| **Authentication**  | SSH plus mutual TLS certificate fingerprint verification |
-| **Forward Secrecy** | Ephemeral key exchange on SSH and TLS 1.3                |
+| Property            | Guarantee                                                                   |
+| ------------------- | --------------------------------------------------------------------------- |
+| **Confidentiality** | SSH for Master↔rcpd and SSH tunnels; TLS 1.3 AES-256-GCM / ChaCha20 on TCP  |
+| **Integrity**       | SSH MAC/AEAD and TLS AEAD                                                   |
+| **Authentication**  | SSH plus mutual TLS pinning (direct TCP) or loopback mutual HMAC (SSH mode) |
+| **Forward Secrecy** | Ephemeral key exchange on SSH and TLS 1.3                                   |
 
 ### Why Certificate Pinning?
 
@@ -277,8 +283,13 @@ still deny service by initiating a bad or deliberately stalled handshake:
 
 Reaching these ports requires network access to the (typically trusted) source host; restrict it
 with `--port-ranges` plus firewall rules, or use `--remote-transport=ssh` (which binds source to
-loopback — `127.0.0.1` or `::1` under `AddressFamily inet6` — and tunnels traffic over SSH while
-preserving mutual TLS 1.3 by default).
+loopback — `127.0.0.1` or `::1` under `AddressFamily inet6` — encrypts the network hop via SSH, and
+authenticates every loopback stream with a 1-RTT mutual HMAC-SHA256 handshake keyed by a per-session
+secret distributed over SSH `stdin`, avoiding double bulk encryption while preserving multi-user
+loopback isolation on Linux). In `--remote-transport=auto`, direct TCP keeps mutual TLS 1.3 and
+`source` refuses SSH HMAC authentication from any non-loopback peer IP so a network peer can never
+downgrade off TLS (and if `--remote-transport=auto` is combined with an explicit non-loopback
+`--bind-ip`, both direct TCP and SSH fallback stay on mutual TLS 1.3).
 
 **Upload reverse-forward isolation (`GatewayPorts`)**: An upload over SSH (`--remote-transport=ssh`,
 or `--remote-transport=auto` after direct TCP fallback) opens reverse forwards (`-R`) on the
@@ -286,8 +297,8 @@ destination host pointing back to the local source daemon. Loopback isolation on
 requires the destination `sshd` to use `GatewayPorts no` (the OpenSSH default) or
 `GatewayPorts clientspecified`. If the destination `sshd` sets `GatewayPorts yes`, OpenSSH binds
 those reverse listeners on wildcard addresses even though `rcp` requests loopback, exposing a
-network route back to the local source daemon. This is especially important when combined with
-`--no-encryption`, which disables Source↔Destination TLS authentication.
+network route back to the local source daemon (still rejected by the per-session mutual HMAC
+handshake unless combined with `--no-encryption`, which disables Source↔Destination authentication).
 
 Tolerating failed source-control handshakes without aborting the daemon remains a future hardening.
 

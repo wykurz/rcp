@@ -17,8 +17,114 @@ pub(super) enum RemoteTransport {
     Auto,
 }
 
-pub(super) const DEFAULT_SSH_TUNNELS: usize = 4;
+const DEFAULT_MAX_SSH_TUNNELS: usize = 16;
 pub(super) const DEFAULT_REMOTE_DIRECT_PROBE_TIMEOUT_SEC: u64 = 3;
+
+/// Whether `source` and `destination` daemons need ephemeral TLS certificates at startup.
+///
+/// Explicit `--remote-transport=ssh` authenticates loopback forwards via a 1-RTT mutual
+/// HMAC-SHA256 handshake instead of double-encrypting inside SSH, so neither daemon needs to
+/// generate a TLS certificate or initialize rustls.
+#[must_use]
+pub(super) const fn daemons_need_tls_certs(
+    no_encryption: bool,
+    transport: RemoteTransport,
+) -> bool {
+    !no_encryption && !matches!(transport, RemoteTransport::Ssh)
+}
+
+/// Resolve the number of parallel SSH tunnels to request for a transfer.
+///
+/// Dry runs always use 1 tunnel (control only). When `--ssh-tunnels` is omitted, the automatic
+/// default tracks `effective_max_connections` (the CPU-derived remote copy concurrency) up to
+/// [`DEFAULT_MAX_SSH_TUNNELS`]. An explicit `--ssh-tunnels=N` overrides that cap (still bounded by
+/// `effective_max_connections`).
+#[must_use]
+pub(super) fn resolve_requested_ssh_tunnels(
+    explicit: Option<std::num::NonZeroUsize>,
+    effective_max_connections: std::num::NonZeroUsize,
+    preview_only: bool,
+) -> usize {
+    if preview_only {
+        return 1;
+    }
+    let desired = match explicit {
+        Some(count) => count.get(),
+        None => effective_max_connections.get().min(DEFAULT_MAX_SSH_TUNNELS),
+    };
+    desired.min(effective_max_connections.get()).max(1)
+}
+
+/// Whether `source_bind_ip` lets SSH port forwards dial `source rcpd` over loopback.
+///
+/// Mirrors [`remote::get_tcp_listener_tunnel_target_ip`] + [`remote::tls::is_loopback_peer`]:
+/// unspecified (`0.0.0.0` / `::`), omitted (`None`), and loopback bind addresses all accept SSH
+/// forwards on loopback, whereas an explicit concrete non-loopback `--bind-ip` delivers a
+/// non-loopback peer IP and therefore stays on mutual TLS 1.3 during `--remote-transport=auto`
+/// SSH fallback.
+fn source_bind_ip_supports_loopback_ssh_auth(source_bind_ip: Option<&str>) -> bool {
+    match source_bind_ip {
+        None => true,
+        Some(bind_ip) => bind_ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_unspecified() || remote::tls::is_loopback_peer(ip)),
+    }
+}
+
+/// Derive matching `(source_peer_auth, destination_peer_auth)` policies for `MasterHello`.
+pub(super) fn plan_peer_auth(
+    no_encryption: bool,
+    transport: RemoteTransport,
+    topology: CopyTopology,
+    source_bind_ip: Option<&str>,
+    source_fingerprint: Option<remote::protocol::CertFingerprint>,
+    destination_fingerprint: Option<remote::protocol::CertFingerprint>,
+) -> anyhow::Result<(remote::protocol::PeerAuth, remote::protocol::PeerAuth)> {
+    if no_encryption {
+        return Ok((
+            remote::protocol::PeerAuth::None,
+            remote::protocol::PeerAuth::None,
+        ));
+    }
+    if transport == RemoteTransport::Ssh {
+        let secret = remote::protocol::SshAuthSecret::generate();
+        return Ok((
+            remote::protocol::PeerAuth::SshSharedSecret {
+                secret: secret.clone(),
+            },
+            remote::protocol::PeerAuth::SshSharedSecret { secret },
+        ));
+    }
+    let src_fp =
+        source_fingerprint.context("source rcpd did not report a TLS certificate fingerprint")?;
+    let dst_fp = destination_fingerprint
+        .context("destination rcpd did not report a TLS certificate fingerprint")?;
+    if transport == RemoteTransport::Auto
+        && topology != CopyTopology::SameHost
+        && source_bind_ip_supports_loopback_ssh_auth(source_bind_ip)
+    {
+        let secret = remote::protocol::SshAuthSecret::generate();
+        Ok((
+            remote::protocol::PeerAuth::AutoTlsOrSshSecret {
+                peer_fingerprint: dst_fp,
+                secret: secret.clone(),
+            },
+            remote::protocol::PeerAuth::AutoTlsOrSshSecret {
+                peer_fingerprint: src_fp,
+                secret,
+            },
+        ))
+    } else {
+        Ok((
+            remote::protocol::PeerAuth::Tls {
+                peer_fingerprint: dst_fp,
+            },
+            remote::protocol::PeerAuth::Tls {
+                peer_fingerprint: src_fp,
+            },
+        ))
+    }
+}
 
 /// Extract an IPv4 literal from a host string for explicit source binding.
 fn extract_bind_ip_from_host(host: &str) -> Option<String> {
@@ -1023,5 +1129,167 @@ mod tests {
             ),
             Some("::1".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_requested_ssh_tunnels_matches_streams_with_overridable_default_cap() {
+        let nz = |n| std::num::NonZeroUsize::new(n).unwrap();
+        // automatic default follows effective streams up to DEFAULT_MAX_SSH_TUNNELS (16)
+        assert_eq!(resolve_requested_ssh_tunnels(None, nz(4), false), 4);
+        assert_eq!(resolve_requested_ssh_tunnels(None, nz(8), false), 8);
+        assert_eq!(resolve_requested_ssh_tunnels(None, nz(16), false), 16);
+        assert_eq!(
+            resolve_requested_ssh_tunnels(None, nz(32), false),
+            DEFAULT_MAX_SSH_TUNNELS
+        );
+        // explicit --ssh-tunnels overrides the default cap both above and below 16
+        assert_eq!(
+            resolve_requested_ssh_tunnels(Some(nz(24)), nz(32), false),
+            24
+        );
+        assert_eq!(resolve_requested_ssh_tunnels(Some(nz(2)), nz(16), false), 2);
+        // still clamped to effective data streams
+        assert_eq!(
+            resolve_requested_ssh_tunnels(Some(nz(64)), nz(32), false),
+            32
+        );
+        // preview/dry-run always uses 1 tunnel
+        assert_eq!(resolve_requested_ssh_tunnels(None, nz(16), true), 1);
+        assert_eq!(resolve_requested_ssh_tunnels(Some(nz(24)), nz(32), true), 1);
+    }
+
+    #[test]
+    fn plan_peer_auth_selects_expected_policy_for_every_transport_and_topology() {
+        let src_fp = [0x11; 32];
+        let dst_fp = [0x22; 32];
+        assert!(daemons_need_tls_certs(false, RemoteTransport::Tcp));
+        assert!(daemons_need_tls_certs(false, RemoteTransport::Auto));
+        assert!(!daemons_need_tls_certs(false, RemoteTransport::Ssh));
+        assert!(!daemons_need_tls_certs(true, RemoteTransport::Tcp));
+        assert!(!daemons_need_tls_certs(true, RemoteTransport::Auto));
+        assert!(!daemons_need_tls_certs(true, RemoteTransport::Ssh));
+        // --no-encryption disables auth everywhere
+        for transport in [
+            RemoteTransport::Tcp,
+            RemoteTransport::Ssh,
+            RemoteTransport::Auto,
+        ] {
+            let (s, d) =
+                plan_peer_auth(true, transport, CopyTopology::Download, None, None, None).unwrap();
+            assert_eq!(s, remote::protocol::PeerAuth::None);
+            assert_eq!(d, remote::protocol::PeerAuth::None);
+        }
+        // explicit SSH uses shared-secret loopback HMAC without TLS certs
+        for topology in [
+            CopyTopology::Download,
+            CopyTopology::Upload,
+            CopyTopology::ThreeHost,
+            CopyTopology::SameHost,
+        ] {
+            let (s, d) = plan_peer_auth(
+                false,
+                RemoteTransport::Ssh,
+                topology,
+                Some("127.0.0.1"),
+                None,
+                None,
+            )
+            .unwrap();
+            match (s, d) {
+                (
+                    remote::protocol::PeerAuth::SshSharedSecret { secret: s_sec },
+                    remote::protocol::PeerAuth::SshSharedSecret { secret: d_sec },
+                ) => assert_eq!(s_sec, d_sec),
+                other => {
+                    panic!("expected matching SshSharedSecret for {topology:?}, got {other:?}")
+                }
+            }
+        }
+        // direct TCP, SameHost auto, and auto with an explicit non-loopback --bind-ip stay on
+        // pure mutual TLS so SSH fallback over a non-loopback listener never trips the strict
+        // loopback peer guard
+        for (transport, topology, bind_ip) in [
+            (RemoteTransport::Tcp, CopyTopology::Download, None),
+            (RemoteTransport::Auto, CopyTopology::SameHost, None),
+            (
+                RemoteTransport::Auto,
+                CopyTopology::Download,
+                Some("10.0.0.5"),
+            ),
+            (
+                RemoteTransport::Auto,
+                CopyTopology::ThreeHost,
+                Some("2001:db8::1"),
+            ),
+        ] {
+            let (s, d) = plan_peer_auth(
+                false,
+                transport,
+                topology,
+                bind_ip,
+                Some(src_fp),
+                Some(dst_fp),
+            )
+            .unwrap();
+            assert_eq!(
+                s,
+                remote::protocol::PeerAuth::Tls {
+                    peer_fingerprint: dst_fp
+                }
+            );
+            assert_eq!(
+                d,
+                remote::protocol::PeerAuth::Tls {
+                    peer_fingerprint: src_fp
+                }
+            );
+        }
+        // non-same-host auto with wildcard/omitted/loopback bind pairs TLS fingerprints with one
+        // shared fallback secret
+        for topology in [
+            CopyTopology::Download,
+            CopyTopology::Upload,
+            CopyTopology::ThreeHost,
+        ] {
+            for bind_ip in [
+                None,
+                Some("0.0.0.0"),
+                Some("::"),
+                Some("127.0.0.1"),
+                Some("::1"),
+                Some("::ffff:127.0.0.1"),
+            ] {
+                let (s, d) = plan_peer_auth(
+                    false,
+                    RemoteTransport::Auto,
+                    topology,
+                    bind_ip,
+                    Some(src_fp),
+                    Some(dst_fp),
+                )
+                .unwrap();
+                match (s, d) {
+                    (
+                        remote::protocol::PeerAuth::AutoTlsOrSshSecret {
+                            peer_fingerprint: s_peer,
+                            secret: s_sec,
+                        },
+                        remote::protocol::PeerAuth::AutoTlsOrSshSecret {
+                            peer_fingerprint: d_peer,
+                            secret: d_sec,
+                        },
+                    ) => {
+                        assert_eq!(s_peer, dst_fp);
+                        assert_eq!(d_peer, src_fp);
+                        assert_eq!(s_sec, d_sec);
+                    }
+                    other => {
+                        panic!(
+                            "expected AutoTlsOrSshSecret for ({topology:?}, {bind_ip:?}), got {other:?}"
+                        )
+                    }
+                }
+            }
+        }
     }
 }

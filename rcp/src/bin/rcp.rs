@@ -8,10 +8,11 @@ use rcp_tools_rcp::path;
 mod ssh_plan;
 
 use ssh_plan::{
-    CopyTopology, DEFAULT_REMOTE_DIRECT_PROBE_TIMEOUT_SEC, DEFAULT_SSH_TUNNELS, InitialTopology,
-    MasterSshTunnelPlan, RemoteCopyOperands, RemoteTransport, ResolvedMasterSshPlan,
-    collect_local_operand_roots, remote_copy_operands, resolve_source_bind_ip_for_transport,
-    resolve_source_target_address_family, source_accept_timeout_sec,
+    CopyTopology, DEFAULT_REMOTE_DIRECT_PROBE_TIMEOUT_SEC, InitialTopology, MasterSshTunnelPlan,
+    RemoteCopyOperands, RemoteTransport, ResolvedMasterSshPlan, collect_local_operand_roots,
+    daemons_need_tls_certs, plan_peer_auth, remote_copy_operands, resolve_requested_ssh_tunnels,
+    resolve_source_bind_ip_for_transport, resolve_source_target_address_family,
+    source_accept_timeout_sec,
 };
 
 #[derive(Parser, Debug, Clone)]
@@ -518,16 +519,18 @@ struct Args {
 
     /// Number of parallel SSH tunnels for source↔destination data transfer when using SSH transport
     ///
-    /// Capped at the effective remote data stream count and degrades gracefully down to 1 if the
-    /// remote SSH server rate-limits extra connections. Ignored for direct TCP and same-host copies.
+    /// When omitted, defaults to the effective remote data stream count capped at 16 (matching the
+    /// CPU-derived remote copy default while avoiding excessive concurrent SSH sessions on large
+    /// hosts). Pass an explicit value to override that default cap in either direction (still
+    /// bounded by effective data streams). Degrades gracefully down to 1 if the remote SSH server
+    /// rate-limits extra connections. Ignored for direct TCP and same-host copies.
     #[arg(
         long,
-        default_value_t = std::num::NonZeroUsize::new(DEFAULT_SSH_TUNNELS).unwrap(),
         value_name = "N",
         value_parser = common::cli::parse_positive_usize,
         help_heading = "Remote copy options"
     )]
-    ssh_tunnels: std::num::NonZeroUsize,
+    ssh_tunnels: Option<std::num::NonZeroUsize>,
 
     /// Forward the local SSH agent (`ForwardAgent=yes`) to the destination host for 3-host SSH copies
     ///
@@ -895,7 +898,7 @@ fn build_master_remote_request(
         profile_level: Some(args.profile_level.clone()),
         tokio_console: args.tokio_console,
         tokio_console_port: args.tokio_console_port,
-        encryption: !args.no_encryption,
+        encryption: daemons_need_tls_certs(args.no_encryption, args.remote_transport),
         ssh_tunnels: 0,
     };
     Ok(MasterRemoteRequest {
@@ -1671,17 +1674,14 @@ async fn run_rcpd_master(
     // remain visible even if any part of destination bring-up fails.
     teardown.retain_tracing_receiver(source_stdout_demux, remote::tracelog::RcpdType::Source);
     tracing::info!(
-        "Source rcpd ready (encryption={})",
+        "Source rcpd ready (tls_cert={})",
         source_readiness.fingerprint.is_some()
     );
-    let requested_tunnels = if request.rcpd.preview_only {
-        1
-    } else {
-        args.ssh_tunnels
-            .get()
-            .min(source_readiness.max_connections.get())
-            .max(1)
-    };
+    let requested_tunnels = resolve_requested_ssh_tunnels(
+        args.ssh_tunnels,
+        source_readiness.max_connections,
+        request.rcpd.preview_only,
+    );
     let mut dest_stdin: Option<remote::stdio::MasterStdinSender> = None;
     let destination_setup = async {
         validate_readiness_encryption("source", request.rcpd.encryption, &source_readiness)?;
@@ -1743,7 +1743,7 @@ async fn run_rcpd_master(
             &destination_readiness,
         )?;
         tracing::info!(
-            "Destination rcpd ready (encryption={})",
+            "Destination rcpd ready (tls_cert={})",
             destination_readiness.fingerprint.is_some()
         );
         anyhow::Ok((destination_readiness, dest_control_rx))
@@ -1775,7 +1775,15 @@ async fn run_rcpd_master(
     );
     let operation_result = async {
         let filter = request.filter;
-        // send MasterHello to source rcpd (include dest fingerprint for mutual TLS)
+        let (source_peer_auth, destination_peer_auth) = plan_peer_auth(
+            args.no_encryption,
+            transport,
+            topology,
+            source_bind_ip.as_deref(),
+            source_readiness.fingerprint,
+            destination_readiness.fingerprint,
+        )?;
+        // send MasterHello to source rcpd with stream authentication policy
         {
             let _span = tracing::trace_span!("send_master_hello_to_source").entered();
             source_stdin
@@ -1784,7 +1792,7 @@ async fn run_rcpd_master(
                 .send_hello(remote::protocol::MasterHello::Source {
                     src: src.path().to_path_buf(),
                     dst: dst.path().to_path_buf(),
-                    dest_cert_fingerprint: destination_readiness.fingerprint,
+                    peer_auth: source_peer_auth,
                     filter,
                     dry_run: args.dry_run,
                     // derived from the SAME `preserve` the destination is handed below, so what
@@ -1940,7 +1948,7 @@ async fn run_rcpd_master(
                     None,
                 ),
             };
-        // send MasterHello to destination rcpd (include source fingerprint for mutual TLS)
+        // send MasterHello to destination rcpd with stream authentication policy
         {
             let _span = tracing::trace_span!("send_master_hello_to_dest").entered();
             dest_stdin
@@ -1951,7 +1959,7 @@ async fn run_rcpd_master(
                     source_data_addrs: dest_data_addrs,
                     server_name: source_hello.server_name.clone(),
                     preserve: *preserve,
-                    source_cert_fingerprint: source_readiness.fingerprint,
+                    peer_auth: destination_peer_auth,
                     dry_run: request.rcpd.preview_only,
                     transport: Box::new(dest_transport),
                 })
@@ -3415,7 +3423,7 @@ mod tests {
     fn remote_transport_flags_default_and_parse_correctly() {
         let defaults = master_args(&[]);
         assert_eq!(defaults.remote_transport, RemoteTransport::Tcp);
-        assert_eq!(defaults.ssh_tunnels.get(), DEFAULT_SSH_TUNNELS);
+        assert_eq!(defaults.ssh_tunnels, None);
         assert!(!defaults.ssh_forward_agent);
         assert_eq!(
             defaults.remote_direct_probe_timeout_sec,
@@ -3428,9 +3436,22 @@ mod tests {
             "--remote-direct-probe-timeout-sec=5",
         ]);
         assert_eq!(custom.remote_transport, RemoteTransport::Auto);
-        assert_eq!(custom.ssh_tunnels.get(), 8);
+        assert_eq!(custom.ssh_tunnels.map(std::num::NonZeroUsize::get), Some(8));
         assert!(custom.ssh_forward_agent);
         assert_eq!(custom.remote_direct_probe_timeout_sec, 5);
+        // explicit --remote-transport=ssh skips daemon TLS certs while tcp and auto keep them
+        let ssh_req = build_master_remote_request(
+            &master_args(&["--remote-transport=ssh"]),
+            common::ResolvedFilesInFlight::automatic(),
+        )
+        .unwrap();
+        assert!(!ssh_req.rcpd.encryption);
+        let auto_req = build_master_remote_request(
+            &master_args(&["--remote-transport=auto"]),
+            common::ResolvedFilesInFlight::automatic(),
+        )
+        .unwrap();
+        assert!(auto_req.rcpd.encryption);
     }
 
     async fn spawn_test_daemon_channels() -> (

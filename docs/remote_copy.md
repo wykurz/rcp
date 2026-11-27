@@ -537,10 +537,11 @@ rcp --remote-transport=ssh --ssh-forward-agent host1:/path host2:/path
 Key behavior:
 
 - **Default**: `--remote-transport=tcp` (direct TCP, highest throughput).
-- **Parallel SSH tunnels**: `--ssh-tunnels=N` (default `4`, capped at effective stream count `E`)
-  stripes data across up to `N` independent SSH connections and degrades gracefully down to `1` if
-  the remote `sshd` rate-limits extra connections. Dry runs (`--dry-run`) open only tunnel #1 for
-  control.
+- **Parallel SSH tunnels**: `--ssh-tunnels=N` defaults to `min(E, 16)` (matching the CPU-derived
+  effective stream count `E` up to 16; pass an explicit value to override that default cap in either
+  direction, still bounded by `E`). It stripes data across up to `N` independent SSH connections and
+  degrades gracefully down to `1` if the remote `sshd` rate-limits extra connections. Dry runs
+  (`--dry-run`) open only tunnel #1 for control.
 - **Same-host copies** (`host:/a host:/b`): stay on direct loopback without SSH data tunneling or
   slow-path warnings whenever both operands share the same `(user, host, port)` (reusing one SSH
   session), or when two independently opened sessions resolve via `ssh -G` to the same effective
@@ -584,8 +585,13 @@ Key behavior:
   the destination `sshd` to use `GatewayPorts no` (the OpenSSH default) or
   `GatewayPorts clientspecified` — `GatewayPorts yes` binds wildcard addresses and can expose a
   route back to the local source, which matters especially with `--no-encryption`.
-- **TLS encryption**: Source↔Destination mutual TLS 1.3 remains enabled by default over SSH tunnels
-  (`--no-encryption` still disables it).
+- **No double encryption over SSH**: SSH already encrypts the network wire, so SSH-tunneled
+  transfers (both `--remote-transport=ssh` and `--remote-transport=auto` after SSH fallback) skip
+  bulk TLS encryption and instead authenticate each loopback TCP stream with a 1-RTT mutual
+  HMAC-SHA256 handshake keyed by a per-session secret distributed over SSH `stdin`. Direct TCP
+  (`--remote-transport=tcp`, `auto` when direct TCP succeeds, and `auto` SSH fallback when an
+  explicit non-loopback `--bind-ip` is set) continues using mutual TLS 1.3. `--no-encryption`
+  disables both encryption and peer authentication.
 
 ### Troubleshooting Checklist
 
@@ -649,7 +655,7 @@ CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu ./scripts/cargo-host.sh build --rele
 | `--remote-copy-conn-timeout-sec=N`          | Positive remote setup/deployment-idle/connection timeout (default: 15; 60 with auto-deploy)       |
 | `--remote-keepalive-sec=N`                  | Dead-peer detection budget, 0 disables (default: 120)                                             |
 | `--remote-transport=MODE`                   | Source↔Destination transport: `tcp` (default), `ssh` (tunneled), or `auto` (TCP then SSH)         |
-| `--ssh-tunnels=N`                           | Parallel SSH tunnels for SSH transport (default: 4, capped by effective streams, degrades to 1)   |
+| `--ssh-tunnels=N`                           | Parallel SSH tunnels for SSH transport (default: `min(E, 16)`, overridable, degrades to 1)        |
 | `--ssh-forward-agent`                       | Forward local SSH agent (`ForwardAgent=yes`) to destination host in 3-host SSH copies             |
 | `--remote-direct-probe-timeout-sec=N`       | Direct-TCP probe timeout before SSH fallback in `--remote-transport=auto` (default: 3)            |
 | `--port-ranges=RANGES`                      | Restrict TCP to specific ports (e.g., "8000-8999"); ignored with warning in `ssh` mode            |

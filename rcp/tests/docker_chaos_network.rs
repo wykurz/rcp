@@ -300,7 +300,9 @@ fn test_chaos_firewall_blocks_direct_tcp_auto_falls_back_to_ssh() -> Result<()> 
         "direct TCP must fail when non-SSH ports are blocked",
     );
     // 2. Download (host-a -> master): auto probes, fails, master opens -L fallback tunnels
+    //    and switches from direct-TCP TLS to loopback HMAC-SHA256 without double encryption
     let dl_out = env.exec_rcp(&[
+        "-vv",
         "--remote-transport=auto",
         "--remote-direct-probe-timeout-sec=2",
         "--ssh-tunnels=2",
@@ -319,6 +321,11 @@ fn test_chaos_firewall_blocks_direct_tcp_auto_falls_back_to_ssh() -> Result<()> 
     assert!(
         dl_combined.contains("falling back to SSH"),
         "expected SSH fallback notice on download:\n{dl_combined}"
+    );
+    assert!(
+        dl_combined.contains("Source control stream authenticated (SSH loopback HMAC-SHA256 auth)")
+            && dl_combined.contains("Destination stream security: SSH loopback HMAC-SHA256 auth"),
+        "auto SSH fallback must switch to loopback HMAC-SHA256 without double TLS:\n{dl_combined}"
     );
     assert_eq!(env.read_file("master", "/tmp/chaos-fw-dl.txt")?, payload);
     // 3. Upload (master -> host-b): auto probes blocked master listener, master opens -R tunnels

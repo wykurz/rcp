@@ -127,9 +127,9 @@ struct DataConnectionPool {
     copy_buffer_retention_limit: usize,
     /// Semaphore to limit concurrent connections
     semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Optional TLS connector for encrypted connections
-    tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
-    /// Upper bound on a single TCP-connect + TLS-handshake, so a worker already past the semaphore
+    /// Stream connector handling mutual TLS 1.3, SSH loopback HMAC-SHA256, or plaintext.
+    stream_connector: remote::tls::StreamConnector,
+    /// Upper bound on a single TCP-connect + stream-handshake, so a worker already past the semaphore
     /// but stuck mid-handshake cannot block the pool drain forever (it would otherwise leave the
     /// file-handler future — and thus `run_destination`'s teardown — waiting indefinitely).
     conn_timeout: std::time::Duration,
@@ -142,7 +142,7 @@ impl DataConnectionPool {
         data_addrs: Vec<std::net::SocketAddr>,
         max_connections: usize,
         tcp_config: &remote::TcpConfig,
-        tls_connector: Option<std::sync::Arc<tokio_rustls::TlsConnector>>,
+        stream_connector: remote::tls::StreamConnector,
         shutdown: ReceiverShutdown,
     ) -> Self {
         Self {
@@ -152,7 +152,7 @@ impl DataConnectionPool {
             keepalive_sec: tcp_config.keepalive_sec,
             copy_buffer_retention_limit: tcp_config.effective_buffer_retention_limit(),
             semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections)),
-            tls_connector,
+            stream_connector,
             conn_timeout: std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
             shutdown,
             peer_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -207,10 +207,11 @@ impl DataConnectionPool {
         let stream =
             remote::connect_tcp_data(data_addr, self.network_profile, self.keepalive_sec).await?;
         let (_send_stream, recv_stream) = remote::tls::connect_bounded(
-            self.tls_connector.as_deref(),
+            &self.stream_connector,
             remote::tls::SERVER_NAME_SOURCE,
             stream,
             self.conn_timeout,
+            remote::tls::StreamKind::Data,
             "data",
         )
         .await?;
@@ -2225,7 +2226,7 @@ pub async fn run_destination(
     concurrency: remote::ResolvedRemoteConcurrency,
     admission: common::EndpointAdmission,
     cert_key: Option<&remote::tls::CertifiedKey>,
-    source_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
+    peer_auth: &remote::protocol::PeerAuth,
     transport: &remote::protocol::DestinationTransport,
     master_control: &remote::stdio::DaemonControlSender,
     fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
@@ -2251,31 +2252,8 @@ pub async fn run_destination(
             concurrency.max_pending_files().get(),
         )?)
     };
-    // create TLS connector if encryption is enabled (requires both cert and source fingerprint)
-    let tls_connector = match (cert_key, source_cert_fingerprint) {
-        (Some(cert), Some(source_fp)) => {
-            // create client config with client certificate for mutual TLS
-            let client_config = remote::tls::create_client_config_with_cert(cert, source_fp)
-                .context("failed to create TLS client config")?;
-            Some(std::sync::Arc::new(tokio_rustls::TlsConnector::from(
-                client_config,
-            )))
-        }
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!(
-                "TLS configuration mismatch: destination certificate and source fingerprint must both be present or both absent"
-            );
-        }
-    };
-    tracing::info!(
-        "Destination TLS encryption: {}",
-        if tls_connector.is_some() {
-            "enabled (mutual TLS)"
-        } else {
-            "disabled"
-        }
-    );
+    // validate certificate alignment before opening TCP or SSH connections
+    peer_auth.validate_cert_presence(cert_key.is_some())?;
     let ConnectedDestinationTransport {
         control_stream,
         data_addrs,
@@ -2304,25 +2282,34 @@ pub async fn run_destination(
         }
     };
     let result = async {
+        let stream_connector =
+            remote::tls::StreamConnector::from_peer_auth(cert_key, peer_auth, via_ssh_tunnel)?;
+        tracing::info!(
+            "Destination stream security: {}",
+            stream_connector.description()
+        );
         tracing::info!("Connected to source control port");
-        // wrap control connection with TLS if configured
-        // the handshake is bounded because a peer that establishes TCP then stalls it would otherwise
+        // authenticate control connection (mTLS, SSH loopback HMAC-SHA256, or plaintext);
+        // the handshake is bounded because a peer that establishes TCP then stalls would otherwise
         // hang here indefinitely, BEFORE any teardown state exists (only the TCP connect above was
         // timed out)
         let (control_send_stream, control_recv_stream) = remote::tls::connect_bounded(
-            tls_connector.as_deref(),
+            &stream_connector,
             remote::tls::SERVER_NAME_SOURCE,
             control_stream,
             std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
+            remote::tls::StreamKind::Control,
             "control",
         )
         .await
         .map_err(attach_ssh_control_hint)?;
-        // a completed mTLS handshake proves end-to-end reachability to source `rcpd`. With
-        // `--no-encryption`, `connect_bounded` only splits the local TCP socket — on an SSH `-L`
-        // tunnel the local listener accepts TCP before `sshd` permits the forward, so defer
-        // `peer_connected` until a framed protocol message arrives from source.
-        if tls_connector.is_some() {
+        // a completed mutual handshake (mTLS or SSH loopback HMAC-SHA256) proves end-to-end
+        // reachability to source `rcpd`. With `--no-encryption`, `connect_bounded` only splits the
+        // local TCP socket — on an SSH `-L` tunnel the local listener accepts TCP before `sshd`
+        // permits the forward, so defer `peer_connected` until a framed protocol message arrives
+        // from source.
+        let authenticates_peer = stream_connector.authenticates_peer();
+        if authenticates_peer {
             peer_connected.store(true, std::sync::atomic::Ordering::Release);
         }
         // wrap in Arc<Mutex<>> for shared access
@@ -2345,14 +2332,13 @@ pub async fn run_destination(
             settings.fail_early,
             error_collector.clone(),
         );
-        let tls_enabled = tls_connector.is_some();
         // create a pool of data connections to source
         let data_pool = std::sync::Arc::new(
             DataConnectionPool::new(
                 data_addrs,
                 concurrency.max_connections().get(),
                 tcp_config,
-                tls_connector,
+                stream_connector,
                 directory_tracker.shutdown().clone(),
             )
             .with_peer_connected(peer_connected.clone()),
@@ -2452,7 +2438,7 @@ pub async fn run_destination(
         match result {
             Err(err)
                 if via_ssh_tunnel
-                    && ((!tls_enabled
+                    && ((!authenticates_peer
                         && !peer_connected.load(std::sync::atomic::Ordering::Acquire))
                         || had_connect_cause)
                     && !completed
@@ -4834,7 +4820,7 @@ mod teardown_tests {
                 conn_timeout_sec: 1,
                 ..Default::default()
             },
-            None,
+            remote::tls::StreamConnector::Plaintext,
             tracker.shutdown().clone(),
         ))
     }
@@ -4860,7 +4846,7 @@ mod teardown_tests {
                 vec![listener.local_addr().unwrap()],
                 1,
                 &tcp,
-                None,
+                remote::tls::StreamConnector::Plaintext,
                 tracker.shutdown().clone(),
             );
             let (receiver, peer) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4910,7 +4896,7 @@ mod teardown_tests {
                 conn_timeout_sec: 60,
                 ..Default::default()
             },
-            Some(Arc::new(tokio_rustls::TlsConnector::from(config))),
+            remote::tls::StreamConnector::Tls(Arc::new(tokio_rustls::TlsConnector::from(config))),
             tracker.shutdown().clone(),
         );
         let admission = tracker
@@ -5125,7 +5111,7 @@ mod teardown_tests {
                     conn_timeout_sec: 1,
                     ..Default::default()
                 },
-                None,
+                remote::tls::StreamConnector::Plaintext,
                 tracker.shutdown().clone(),
             ));
             let source = async {
@@ -5794,7 +5780,7 @@ mod teardown_tests {
                 conn_timeout_sec: 5,
                 ..Default::default()
             },
-            None,
+            remote::tls::StreamConnector::Plaintext,
             tracker.shutdown().clone(),
         ));
         let worker_owner = Arc::downgrade(&pool);
@@ -6052,7 +6038,7 @@ mod ssh_transport_tests {
             vec![addr_a, addr_b],
             4,
             &tcp,
-            None,
+            remote::tls::StreamConnector::Plaintext,
             ReceiverShutdown::default(),
         );
         for _ in 0..2 {
@@ -6225,7 +6211,7 @@ mod ssh_transport_tests {
                 concurrency,
                 common::EndpointAdmission::Disabled,
                 None,
-                None,
+                &remote::protocol::PeerAuth::None,
                 &remote::protocol::DestinationTransport::MasterSshTunnel,
                 &control_tx,
                 None,
@@ -6289,7 +6275,7 @@ mod ssh_transport_tests {
                     concurrency,
                     common::EndpointAdmission::Disabled,
                     None,
-                    None,
+                    &remote::protocol::PeerAuth::None,
                     &remote::protocol::DestinationTransport::MasterSshTunnel,
                     &control_tx,
                     None,
@@ -6374,7 +6360,7 @@ mod ssh_transport_tests {
                 concurrency,
                 common::EndpointAdmission::Disabled,
                 None,
-                None,
+                &remote::protocol::PeerAuth::None,
                 &remote::protocol::DestinationTransport::MasterSshTunnel,
                 &control_tx,
                 None,
@@ -6432,7 +6418,7 @@ mod ssh_transport_tests {
                     concurrency,
                     common::EndpointAdmission::Disabled,
                     None,
-                    None,
+                    &remote::protocol::PeerAuth::None,
                     &remote::protocol::DestinationTransport::MasterSshTunnel,
                     &control_tx,
                     None,

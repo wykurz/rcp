@@ -741,7 +741,7 @@ where
             remote::protocol::MasterHello::Source {
                 src,
                 dst,
-                dest_cert_fingerprint,
+                peer_auth,
                 filter,
                 dry_run,
                 capture,
@@ -764,7 +764,7 @@ where
                     args.bind_ip.as_deref(),
                     accept_timeout,
                     cert_key.as_ref(),
-                    dest_cert_fingerprint,
+                    &peer_auth,
                     &peer_connected_for_op,
                 )
                 .await
@@ -774,7 +774,7 @@ where
                 source_data_addrs,
                 server_name,
                 preserve,
-                source_cert_fingerprint,
+                peer_auth,
                 dry_run,
                 transport,
             } => {
@@ -798,7 +798,7 @@ where
                     concurrency,
                     admission,
                     cert_key.as_ref(),
-                    source_cert_fingerprint,
+                    &peer_auth,
                     &transport,
                     &control_for_op,
                     fallback_rx,
@@ -1126,7 +1126,7 @@ async fn async_main(
         }))
     };
     tracing::info!(
-        "Master SSH stdio channel ready (source↔destination encryption={})",
+        "Master SSH stdio channel ready (source↔destination TLS cert={})",
         !args.no_encryption
     );
     let outcome = run_operation(
@@ -1839,7 +1839,7 @@ mod tests {
                     remote::protocol::MasterHello::Source {
                         src: "/src".into(),
                         dst: "/dst".into(),
-                        dest_cert_fingerprint: None,
+                        peer_auth: remote::protocol::PeerAuth::None,
                         filter: None,
                         dry_run: None,
                         capture: Default::default(),
@@ -1871,7 +1871,7 @@ mod tests {
         let expected_hello = remote::protocol::MasterHello::Source {
             src: "/src".into(),
             dst: "/dst".into(),
-            dest_cert_fingerprint: None,
+            peer_auth: remote::protocol::PeerAuth::None,
             filter: Some(filter),
             dry_run: None,
             capture: Default::default(),
@@ -1957,7 +1957,7 @@ mod tests {
         let expected_hello = remote::protocol::MasterHello::Source {
             src: "/src".into(),
             dst: "/dst".into(),
-            dest_cert_fingerprint: None,
+            peer_auth: remote::protocol::PeerAuth::None,
             filter: None,
             dry_run: None,
             capture: Default::default(),
@@ -2190,7 +2190,7 @@ mod tests {
                 let source = remote::protocol::MasterHello::Source {
                     src: "/source".into(),
                     dst: "/destination".into(),
-                    dest_cert_fingerprint: None,
+                    peer_auth: remote::protocol::PeerAuth::None,
                     filter: None,
                     dry_run: dry_run.then_some(common::DryRunMode::Brief),
                     capture: Default::default(),
@@ -2201,7 +2201,7 @@ mod tests {
                     source_data_addrs: vec!["127.0.0.1:10002".parse().unwrap()],
                     server_name: "source".to_owned(),
                     preserve: Default::default(),
-                    source_cert_fingerprint: None,
+                    peer_auth: remote::protocol::PeerAuth::None,
                     dry_run,
                     transport: Box::new(remote::protocol::DestinationTransport::Direct),
                 };

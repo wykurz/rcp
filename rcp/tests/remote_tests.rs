@@ -10759,7 +10759,7 @@ fn test_remote_ssh_transport_download_upload_three_host_and_same_host() {
     create_test_file(&src_tree.join("b.txt"), "beta payload", 0o644);
     create_test_file(&src_tree.join("sub/c.txt"), "gamma payload", 0o644);
     let src_path = src_tree.to_str().unwrap();
-    // 1. Download (-L) with 3 parallel tunnels and default mTLS at default verbosity
+    // 1. Download (-L) with 3 parallel tunnels and default SSH loopback HMAC auth at default verbosity
     let dst_download = dst_dir.path().join("download");
     let src_localhost = format!("localhost:{src_path}");
     let out = run_rcp_with_args_at_default_verbosity(&[
@@ -12409,40 +12409,42 @@ fn test_remote_ssh_plaintext_denied_forward_fails_promptly() {
     let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
     let src_remote = format!("no-fwd-src:{}", src_file.to_str().unwrap());
     let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
-    // conn_timeout=30 gives source a 60s accept_timeout_sec; with --no-encryption, a denied -L
-    // forward must keep peer_connected=false so master cancels source promptly (~2s grace) instead
-    // of waiting 60s for source's accept timeout.
-    let started = std::time::Instant::now();
-    let out = run_rcp_with_args_home_and_env(
-        &[
+    // conn_timeout=30 gives source a 60s accept_timeout_sec; under both default SSH HMAC auth and
+    // --no-encryption, a denied -L forward must keep peer_connected=false so master cancels source
+    // promptly (~2s grace) instead of waiting 60s for source's accept timeout.
+    for no_encryption in [false, true] {
+        let started = std::time::Instant::now();
+        let mut args = vec![
             "--remote-transport=ssh",
-            "--no-encryption",
+            "--ssh-tunnels=1",
             "--remote-copy-conn-timeout-sec=30",
             &rcpd_flag,
-            &src_remote,
-            dst_file.to_str().unwrap(),
-        ],
-        home.path(),
-        &env,
-    );
-    let elapsed = started.elapsed();
-    assert!(
-        !out.status.success(),
-        "SSH transfer with AllowTcpForwarding no must fail"
-    );
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        combined.contains("AllowTcpForwarding"),
-        "expected AllowTcpForwarding diagnostic on denied plaintext forward:\n{combined}"
-    );
-    assert!(
-        elapsed < std::time::Duration::from_secs(12),
-        "plaintext denied forward must fail promptly without waiting for source accept_timeout_sec (elapsed={elapsed:?}):\n{combined}"
-    );
+        ];
+        if no_encryption {
+            args.push("--no-encryption");
+        }
+        args.push(&src_remote);
+        args.push(dst_file.to_str().unwrap());
+        let out = run_rcp_with_args_home_and_env(&args, home.path(), &env);
+        let elapsed = started.elapsed();
+        assert!(
+            !out.status.success(),
+            "SSH transfer with AllowTcpForwarding no must fail (no_encryption={no_encryption})"
+        );
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("AllowTcpForwarding"),
+            "expected AllowTcpForwarding diagnostic on denied forward (no_encryption={no_encryption}):\n{combined}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "denied forward must fail promptly without waiting for source accept_timeout_sec (no_encryption={no_encryption}, elapsed={elapsed:?}):\n{combined}"
+        );
+    }
     drop(sshd_local);
     drop(sshd_no_fwd);
 }
@@ -13566,4 +13568,81 @@ fn test_remote_ssh_transport_upload_ipv6_session_with_ipv4_permit_listen() {
     );
     drop(sshd_local);
     drop(sshd_dst);
+}
+
+#[test]
+fn test_remote_ssh_auth_avoids_double_encryption_and_defaults_tunnels_to_streams() {
+    require_local_ssh();
+    let (src_dir, dst_dir) = setup_test_env();
+    let src_tree = src_dir.path().join("tree");
+    std::fs::create_dir_all(&src_tree).unwrap();
+    create_test_file(&src_tree.join("a.txt"), "hmac alpha", 0o644);
+    create_test_file(&src_tree.join("b.txt"), "hmac beta", 0o644);
+    let src_path = src_tree.to_str().unwrap();
+    let src_localhost = format!("localhost:{src_path}");
+    // 1. Explicit --remote-transport=ssh skips TLS cert generation, uses loopback HMAC-SHA256
+    //    auth without double encryption, and defaults --ssh-tunnels to match effective streams.
+    let dst_ssh = dst_dir.path().join("ssh_auto_tunnels");
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "-vv",
+        "--remote-transport=ssh",
+        "--max-files-in-flight=3",
+        &src_localhost,
+        dst_ssh.to_str().unwrap(),
+    ]);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "SSH download with automatic tunnel count failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (3 parallel tunnels)"),
+        "omitting --ssh-tunnels should follow effective stream count (3):\n{combined}"
+    );
+    assert!(
+        combined.contains("Source stream security: SSH loopback HMAC-SHA256 auth"),
+        "expected source SSH loopback HMAC auth log:\n{combined}"
+    );
+    assert!(
+        combined.contains("Destination stream security: SSH loopback HMAC-SHA256 auth"),
+        "expected destination SSH loopback HMAC auth log:\n{combined}"
+    );
+    assert!(
+        combined.contains("Source rcpd ready (tls_cert=false)")
+            && combined.contains("Destination rcpd ready (tls_cert=false)"),
+        "explicit --remote-transport=ssh must skip TLS certificate generation:\n{combined}"
+    );
+    assert!(
+        !combined.contains("mutual TLS 1.3"),
+        "explicit --remote-transport=ssh must not double-encrypt with TLS:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_ssh.join("a.txt")), "hmac alpha");
+    assert_eq!(get_file_content(&dst_ssh.join("b.txt")), "hmac beta");
+    // 2. --remote-transport=auto keeps mutual TLS 1.3 when direct TCP succeeds.
+    let dst_auto = dst_dir.path().join("auto_direct_tls");
+    let out = run_rcp_with_args_at_default_verbosity(&[
+        "-vv",
+        "--remote-transport=auto",
+        &src_localhost,
+        dst_auto.to_str().unwrap(),
+    ]);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "auto direct download failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Source control stream authenticated (mutual TLS 1.3)")
+            && combined.contains("Destination stream security: mutual TLS 1.3"),
+        "auto direct TCP must authenticate with mutual TLS 1.3:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_auto.join("a.txt")), "hmac alpha");
 }

@@ -3921,7 +3921,7 @@ impl PreparedRcpd {
             "stderr",
         )));
         tracing::info!(
-            "rcpd ready on {} (encryption={})",
+            "rcpd ready on {} (tls_cert={})",
             session.host,
             readiness.fingerprint.is_some()
         );

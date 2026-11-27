@@ -1,7 +1,7 @@
 # Remote wire fixtures
 
-`wire-v14.txt` records named, fixed bitcode payloads (hexadecimal, one message per line) for
-`remote::version::WIRE_REVISION = 14`. `wire_compatibility.rs` selects the fixture set by revision;
+`wire-v15.txt` records named, fixed bitcode payloads (hexadecimal, one message per line) for
+`remote::version::WIRE_REVISION = 15`. `wire_compatibility.rs` selects the fixture set by revision;
 an unrecognized revision fails even if its bytes have not changed. The tests encode deterministic
 values to those bytes and separately decode the stored bytes to named field values, compared through
 Serde JSON values. They never regenerate fixtures while testing.
@@ -17,7 +17,7 @@ The samples cover `MasterToRcpd` envelopes (both `MasterHello` variants, `Heartb
 and failure results, and tracing log/progress messages), directory limits, every source/destination
 control variant, and file headers. Nested samples include populated copy/removal summaries, all
 nonzero runtime statistics, distinct metadata fields, unknown/captured/absent ACLs, filters,
-preserve settings, all dry-run modes, all `DestinationTransport` variants, optional fingerprints,
+preserve settings, all dry-run modes, all `DestinationTransport` variants, all `PeerAuth` variants,
 IPv4/IPv6, and UTF-8 paths. ACL blobs are opaque byte samples; no kernel ACL operation is exercised.
 Fixtures use explicit values rather than runtime statistics, filesystem metadata, clocks, or
 production defaults.

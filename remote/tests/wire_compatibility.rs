@@ -16,7 +16,7 @@ struct Fixtures {
 impl Fixtures {
     fn new(direction: Direction) -> Self {
         let text = match remote::version::WIRE_REVISION {
-            14 => include_str!("fixtures/wire-v14.txt"),
+            15 => include_str!("fixtures/wire-v15.txt"),
             revision => panic!(
                 "wire revision {revision} needs reviewed fixtures; see remote/tests/fixtures/README.md"
             ),
@@ -125,9 +125,12 @@ fn check_messages(direction: Direction) {
     filter.add_include("**/*.rs").unwrap();
     filter.add_include("docs/**").unwrap();
     filter.add_exclude("target/**").unwrap();
-    for (name, dry_run, capture) in [
+    for (name, peer_auth, dry_run, capture) in [
         (
             "master-source-brief",
+            PeerAuth::Tls {
+                peer_fingerprint: std::array::from_fn(|i| i as u8),
+            },
             Some(common::config::DryRunMode::Brief),
             ExtendedMetadataCapture {
                 file_acl: true,
@@ -137,6 +140,9 @@ fn check_messages(direction: Direction) {
         ),
         (
             "master-source-all",
+            PeerAuth::SshSharedSecret {
+                secret: SshAuthSecret::from_bytes(std::array::from_fn(|i| 0x40 + i as u8)),
+            },
             Some(common::config::DryRunMode::All),
             ExtendedMetadataCapture {
                 file_acl: false,
@@ -146,6 +152,10 @@ fn check_messages(direction: Direction) {
         ),
         (
             "master-source-explain",
+            PeerAuth::AutoTlsOrSshSecret {
+                peer_fingerprint: std::array::from_fn(|i| i as u8),
+                secret: SshAuthSecret::from_bytes(std::array::from_fn(|i| 0x80 + i as u8)),
+            },
             Some(common::config::DryRunMode::Explain),
             ExtendedMetadataCapture {
                 file_acl: false,
@@ -159,7 +169,7 @@ fn check_messages(direction: Direction) {
             MasterToRcpd::Hello(Box::new(MasterHello::Source {
                 src: "/src/α".into(),
                 dst: "/dst/b".into(),
-                dest_cert_fingerprint: Some(std::array::from_fn(|i| i as u8)),
+                peer_auth,
                 filter: Some(filter.clone()),
                 dry_run,
                 capture,
@@ -172,7 +182,7 @@ fn check_messages(direction: Direction) {
         MasterToRcpd::Hello(Box::new(MasterHello::Source {
             src: "/source".into(),
             dst: "/destination".into(),
-            dest_cert_fingerprint: None,
+            peer_auth: PeerAuth::None,
             filter: None,
             dry_run: None,
             capture: ExtendedMetadataCapture {
@@ -210,17 +220,21 @@ fn check_messages(direction: Direction) {
             },
         },
     };
-    for (name, fingerprint, dry_run, data_addrs, transport) in [
+    for (name, peer_auth, dry_run, data_addrs, transport) in [
         (
             "master-destination-tls",
-            Some(std::array::from_fn(|i| 255 - i as u8)),
+            PeerAuth::Tls {
+                peer_fingerprint: std::array::from_fn(|i| 255 - i as u8),
+            },
             false,
             vec!["[2001:db8::1234]:3456".parse().unwrap()],
             DestinationTransport::Direct,
         ),
         (
             "master-destination-master-ssh",
-            Some(std::array::from_fn(|i| i as u8)),
+            PeerAuth::SshSharedSecret {
+                secret: SshAuthSecret::from_bytes(std::array::from_fn(|i| i as u8)),
+            },
             false,
             vec![
                 "127.0.0.1:40001".parse().unwrap(),
@@ -230,7 +244,7 @@ fn check_messages(direction: Direction) {
         ),
         (
             "master-destination-preview",
-            None,
+            PeerAuth::None,
             true,
             vec![],
             DestinationTransport::AutoMasterSsh {
@@ -239,7 +253,9 @@ fn check_messages(direction: Direction) {
         ),
         (
             "master-destination-direct-ssh",
-            Some(std::array::from_fn(|i| 128 ^ (i as u8))),
+            PeerAuth::SshSharedSecret {
+                secret: SshAuthSecret::from_bytes(std::array::from_fn(|i| 128 ^ (i as u8))),
+            },
             false,
             vec![
                 "127.0.0.1:41001".parse().unwrap(),
@@ -265,7 +281,10 @@ fn check_messages(direction: Direction) {
         ),
         (
             "master-destination-auto-direct-ssh",
-            None,
+            PeerAuth::AutoTlsOrSshSecret {
+                peer_fingerprint: std::array::from_fn(|i| 0x20 + i as u8),
+                secret: SshAuthSecret::from_bytes(std::array::from_fn(|i| 0xa0 + i as u8)),
+            },
             false,
             vec!["198.51.100.9:5678".parse().unwrap()],
             DestinationTransport::AutoDirectSsh {
@@ -295,7 +314,7 @@ fn check_messages(direction: Direction) {
                 source_data_addrs: data_addrs,
                 server_name: "source.example".into(),
                 preserve,
-                source_cert_fingerprint: fingerprint,
+                peer_auth,
                 dry_run,
                 transport: Box::new(transport),
             })),

@@ -1152,7 +1152,7 @@ mod tests {
             .send_hello(crate::protocol::MasterHello::Source {
                 src: "/src".into(),
                 dst: "/dst".into(),
-                dest_cert_fingerprint: None,
+                peer_auth: crate::protocol::PeerAuth::None,
                 filter: None,
                 dry_run: None,
                 capture: Default::default(),
