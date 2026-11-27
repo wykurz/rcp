@@ -154,6 +154,30 @@ def cells_html(value):
             "<tbody>" + "".join(rows) + "</tbody></table></div>")
 
 
+def reference_html(value):
+    """Set what each other tool took beside rcp, for every copy of a run that such a tool made too."""
+    found = history.references(value)
+    if not found:
+        return ""
+    tools = [tool for tool in history.REFERENCE_TOOLS if any(tool in entry["tools"] for entry in found.values())]
+    multiple = next(iter(found.values()))["multiple"]
+    rows = []
+    for (case, copies), entry in found.items():
+        cells = []
+        for tool in tools:
+            figures = history.reference_figures(entry, tool) if tool in entry["tools"] else ("—",)
+            cells.append("not measured" if figures is None else "<br>".join(part for part in figures if part))
+        rows.append("<tr><td>" + _name(case, history.NAMES) + "</td><td>" + _name(copies, history.SCENARIOS) +
+                    "</td><td>" + history.span(entry["rcp"]) + "</td>" +
+                    "".join("<td>" + cell + "</td>" for cell in cells) + "</tr>")
+    return ("<h3 id='reference'>cp and rsync beside rcp</h3><p>What each tool took for the copies of this run, as the "
+            "median of its copies, and how that stands against rcp." +
+            ("" if multiple is None else f" A tool has {multiple:g} times what rcp took and is cut off then.") +
+            "</p><div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Copy</th><th>rcp</th>" +
+            "".join("<th><code>" + history.REFERENCE_TOOLS[tool] + "</code></th>" for tool in tools) +
+            "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
+
+
 def commit_html(identity, revision):
     """Link a validated revision to its commit in the repository that ran the workflow."""
     repository = identity["run_url"].split("/actions/")[0]
@@ -199,7 +223,7 @@ def render(value, *, diagnostics=None):
     if not value["measurements"]:
         html += "<p>This run has no performance measurements.</p>"
     if matrix and value["cells"]:
-        html += cells_html(value)
+        html += cells_html(value) + reference_html(value)
     # a run that measured more than local copies names the scenario of each summary
     several = matrix and any(cell["scenario"] != history.LOCAL for cell in value["cells"])
     points = {scenario: history.point(value, diagnostics, scenario) for scenario in history.TRENDS}

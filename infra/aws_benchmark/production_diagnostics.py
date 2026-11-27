@@ -10,7 +10,7 @@ import re
 
 from benchmarks import nfs_rpc, work_progress
 from benchmarks.operations import expected_counts
-from .common import digest, require
+from .common import MATRIX_REFERENCE_LIMIT, digest, require
 from .json_bytes import encoded
 
 SCHEMA = "rcp-public-resource-diagnostics-v1"
@@ -950,12 +950,14 @@ def _observed_html(observations):
     return text
 
 
-def configuration_html(observations, *, remote=False, tools=False, elsewhere=False, sized=False, storage=""):
+def configuration_html(observations, *, remote=False, tools=False, elsewhere=False, sized=False, storage="",
+                       reference=False):
     """Describe the shared configured design once, then the observed values merged across runs.
 
     Each observation is dict(run=label, href=run page, setup=observed setup), oldest first.
     Remote copies are described once a run has a remote cell, the other tools once a run has a
     cell of one, and the storage beside the arrays (`elsewhere`) once a run has a cell there.
+    How cp and rsync are measured is described once a run has a cell of one (`reference`).
     The file sets are those of the weekly suite (`sized`) once it has measured something, and
     the ones before them until then. `storage` is the table of what the arrays did during the
     newest run's copies, placed under what the drives allow.
@@ -1025,6 +1027,18 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
         "own CPU time and peak memory. Such a run clears every tree with that <code>rrm</code>, unmeasured: what "
         "<code>rlink</code> made and each file set that is done with. Should <code>rrm</code> fail at one, "
         "<code>rm -rf</code> clears the trees from then on and the run page says so." + untimed + "</li>")
+    beside_rcp = ("" if not reference else
+        "<li id='reference'><strong>cp and rsync.</strong> One suite, run when asked and not every week, copies each "
+        "file set with two more tools, to say what they take here: <code>cp -a</code> and <code>rsync -a</code>, as "
+        "the image of the worker has them. Each copies a file set three times, after rcp's three copies of it, "
+        "between the same two places and with the cache dropped before each copy. Beside the remote copies, "
+        "<code>rsync</code> pulls the file set over SSH from the private sshd on loopback: one <code>rsync</code> on "
+        "each end and the data in the SSH connection, where rcp has a daemon on each end and connections of their "
+        "own. A copy by either tool counts when it exits cleanly. Neither reports what it copied or what it used, so "
+        f"there is no CPU time and no memory for them. A copy of theirs has {MATRIX_REFERENCE_LIMIT} times the median "
+        "of rcp's copies of the same file set: one that takes longer is cut off, shown as not finished, and the tool "
+        "is not tried again on that file set. These tools do not change with rcp, so nothing is gained by timing "
+        "them every week: the page of each kind of copy says when they were.</li>")
     # what would otherwise surprise a reader: copies of a terabyte take as long as the destination array needs
     same = ("A local copy and a remote copy of the same file set that both keep up with the array therefore take "
             "almost the same time. " if remote else "")
@@ -1077,7 +1091,7 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
         "(16 files of 4 MB and 10,000 files of 1 KB) to exercise a run end to end; they are not performance "
         "data and have no trend.</p></section>"
         "<section aria-labelledby='method'><h2 id='method'>Method</h2><ul>"
-        + copy + other +
+        + copy + other + beside_rcp +
         "<li><strong>Fixtures.</strong> Fixtures are random bytes without a fixed seed, generated with "
         "<code>filegen --leaf-files</code> and a write buffer of min(file size, 1 MiB).</li>"
         "<li><strong>Binaries.</strong> Release x86-64 musl binary source revisions and digests are recorded "

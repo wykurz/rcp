@@ -29,18 +29,18 @@ class StorageTrendTests(unittest.TestCase):
     def test_cells_and_trends_are_named_once(self):
         tools = lambda *copies: [kind + "-" + tool for kind in copies for tool in TOOLS]
         # the names of the cells that there were keep their place and their wording
-        self.assertEqual(list(history.SCENARIOS), ["local", "remote", *tools("local", "remote"),
-                                                   "nfs", "memory", *tools("nfs", "memory")])
+        self.assertEqual(list(history.SCENARIOS)[:16], ["local", "remote", *tools("local", "remote"),
+                                                        "nfs", "memory", *tools("nfs", "memory")])
         self.assertEqual({scenario: history.SCENARIOS[scenario] for scenario in ("nfs", "memory", "nfs-rrm",
                                                                                  "memory-rcmp", "remote-rrm")},
                          {"nfs": "Copy between NFS mounts", "memory": "Copy in memory",
                           "nfs-rrm": "Remove with rrm, after a copy between NFS mounts",
                           "memory-rcmp": "Compare with rcmp, after a copy in memory",
                           "remote-rrm": "Remove with rrm, after a remote copy"})
-        # every scenario that a suite can select has a name; the cells in which another tool copies a
-        # file set get theirs with their place on the pages
+        # every scenario that a suite can select has a name, and so has every cell in which another
+        # tool copies a file set: those follow the cells there were (test_reference_pages.py)
         self.assertEqual(set(history.SCENARIOS), {scenario for cells in common.MATRIX_SUITES.values()
-                                                  for _, scenario in cells} - set(common.MATRIX_REFERENCE_CELLS))
+                                                  for _, scenario in cells} | set(history.REFERENCE_CELLS))
         self.assertEqual(history.TOOL_CELLS, frozenset(tools(*COPIES)))
         # a trend is a kind of copy or a tool; a tool's trend takes its cells after every kind of copy
         self.assertEqual(history.TRENDS, (*COPIES, *TOOLS))

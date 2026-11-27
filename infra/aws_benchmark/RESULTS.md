@@ -397,6 +397,14 @@ summarizes its run on the file sets that run measured, whichever they are. The t
 tabulates what the arrays did during the newest run on the current file sets. No record or
 diagnostics format changes for this.
 
+A run of [the reference suite](PRODUCTION.md#the-reference-suite) copies each file set with `cp` and
+`rsync` after rcp has. The page of each kind of copy then has a part *Other tools* under each file
+set that such a run measured: what rcp, `cp -a` and `rsync -a` took there and how each stands
+against rcp, with the run, its day and the versions of the two tools. A tool whose copy was cut off
+is shown as not finished in the time it was given. These are measurements of one day and no trend:
+the part shows the newest run that has them. The run page sets the tools beside rcp for every copy
+of the run, and the test setup page says how the tools are run.
+
 The test setup page says what the storage allows. Each array is two of the machine's four NVMe
 drives, which AWS's instance-store specification for compute optimized instances gives together as
 1,400,000 random reads and 680,000 writes of 4 KiB a second; a terabyte file set is several times

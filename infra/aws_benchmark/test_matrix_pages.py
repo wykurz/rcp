@@ -16,10 +16,15 @@ NOT_RUN = dict(status="not_run", stage=None, message="allocation ended before th
 
 
 def matrix_example(suite="matrix-1g-local", run="43200000001", at="2026-11-20T08:30:00+00:00", outcomes=None,
-                   notes=()):
-    """One frozen matrix record with its diagnostics, as the publisher would hold them."""
+                   notes=(), adjust=None):
+    """One frozen matrix record with its diagnostics, as the publisher would hold them.
+
+    `adjust` changes the runner's document before anything is derived from it.
+    """
     raw = matrix_record(suite, outcomes, environment=ENVIRONMENT)
     raw["timestamp"] = at
+    if adjust is not None:
+        adjust(raw)
     cells = [dict(case_id=cell["case_id"], scenario=cell["scenario"], outcome=cell["outcome"]["status"],
                   stage=cell["outcome"]["stage"], message=cell["outcome"]["message"]) for cell in raw["cells"]]
     # the record of a suite with tool cells is the later version, where a tool cell names what its tool ran

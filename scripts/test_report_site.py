@@ -807,6 +807,39 @@ class ReportSiteTests(unittest.TestCase):
         self.assertTrue((self.output / 'aws-benchmarks/remote.html').is_file())
         self.assert_site_links_resolve()
 
+    def test_the_pages_say_what_cp_and_rsync_took_once_a_run_has_copied_with_them(self):
+        import report_site
+        from infra.aws_benchmark import common, production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        def site(runs):
+            return report_site.render_aws_benchmarks(
+                {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+                diagnostics={record['run_key']: extra for record, extra in runs})
+        weekly = matrix_example(common.MATRIX_WEEKLY, at='2026-12-07T08:30:00+00:00')
+        # until a run has a cell of one, no page says anything of them
+        for path, document in site([weekly]).items():
+            if path.suffix == '.html':
+                with self.subTest(page=str(path)):
+                    for phrase in ('rsync', "class='reference'", "id='reference'"):
+                        self.assertNotIn(phrase, document)
+        reference = matrix_example('matrix-reference-1', run='43400000001', at='2026-12-10T10:00:00+00:00')
+        pages = site([weekly, reference])
+        root = Path('aws-benchmarks')
+        self.assertIn("<li id='reference'><strong>cp and rsync.</strong>", pages[root / 'setups.html'])
+        # a part under each file set that they copied, on the page of its kind of copy
+        for name, count in (('local.html', 3), ('remote.html', 3), ('nfs.html', 1)):
+            self.assertEqual(pages[root / name].count("<div class='reference'>"), count, name)
+            # which leads to how the tools were run
+            self.assertIn("<a href='setups.html#reference'>How these were measured</a>", pages[root / name])
+        self.assertIn('was measured once, for reference: see the page of each kind of copy', pages[root / 'index.html'])
+        run = pages[root / 'runs' / (reference[0]['run_key'] + '.html')]
+        self.assertIn("<h3 id='reference'>cp and rsync beside rcp</h3>", run)
+        self.assertIn('<td>Local copy by rsync</td>', run)
+        for name in ('memory.html', 'rcmp.html', 'rlink.html', 'rrm.html'):
+            self.assertNotIn("class='reference'", pages[root / name], name)
+        # the copies by rcp of that run are points like any other: both runs are in every trend they share
+        self.assertIn(' · 2 runs</p>', pages[root / 'local.html'])
+
     def test_each_other_tool_gets_a_page_of_its_own_once_a_run_times_it(self):
         import report_site
         from infra.aws_benchmark import production_export
