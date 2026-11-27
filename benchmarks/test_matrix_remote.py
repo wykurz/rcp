@@ -521,7 +521,9 @@ class RemoteCellTests(unittest.TestCase):
     def test_only_known_scenarios_are_selected(self):
         self.assertEqual(matrix.SCENARIOS, ("local", "remote", "nfs", "memory", "local-rcmp", "local-rlink", "local-rrm",
                                             "remote-rcmp", "remote-rlink", "remote-rrm", "nfs-rcmp", "nfs-rlink",
-                                            "nfs-rrm", "memory-rcmp", "memory-rlink", "memory-rrm"))
+                                            "nfs-rrm", "memory-rcmp", "memory-rlink", "memory-rrm",
+                                            "local-cp", "nfs-cp", "memory-cp", "local-rsync", "remote-rsync",
+                                            "nfs-rsync", "memory-rsync"))
         with self.assertRaisesRegex(ValueError, "unknown scenario: wan"):
             self.run_matrix(cells=("alpha:wan",))
         self.assertFalse((self.root / "out").exists())

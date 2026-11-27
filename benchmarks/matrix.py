@@ -35,6 +35,18 @@ mounts and roots and makes none. A run that was given a reason in their place
 (`--nfs-unavailable`, `--memory-unavailable`) fails the cells there with it and
 measures the rest.
 
+Seven more scenarios copy a file set with another tool, for reference: `local-cp`, `nfs-cp` and
+`memory-cp` with `cp -a`, and `local-rsync`, `remote-rsync`, `nfs-rsync` and `memory-rsync` with
+`rsync -a`. Such a cell stands beside the copy cell it is named after, which comes before it:
+the same file set between the same roots, with a cache dropped before each copy where one is
+dropped before rcp's. cp copies between two directories of one host. So does rsync, and beside
+remote copies it pulls the file set through the private sshd, which starts the same rsync
+there. Neither tool says what it copied or what it used, so a copy of theirs counts on its exit
+status alone and has no figures. On some file sets these tools take many times what rcp takes,
+and how many times is not worth hours: a copy of theirs gets ten times the median of rcp's
+copies in the cell beside it (`--reference-limit`), in place of the fixed limit of every other
+command. One that is cut off there ends its cell as timed out and is not repeated.
+
 A run that has an rrm cell clears every tree with that rrm, as a user of the
 tools would: what rlink made, a file set that is done with, a copy that no rrm
 cell follows. Such a removal is not measured. Should rrm fail at one, `rm -rf`
@@ -67,6 +79,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import statistics
 import subprocess
@@ -127,17 +140,50 @@ def _tool_cells(copies):
 
 
 TOOLS = _tool_cells(COPIES)
-SCENARIOS = (*COPIES, *TOOLS)
-# how each scenario reaches its data: directly, or through rcpd on this host's loopback
-TOPOLOGY = {**{scenario: "local" for scenario in SCENARIOS}, "remote": "loopback"}
+# what each of the tools that copy a file set for reference runs, and the copy cells that its own
+# can stand `beside`: cp copies between two directories of one host, and rsync also pulls from one
+REFERENCE_RUNS = {
+    "cp": dict(variant=dict(id="cp-a", description="cp -a of the file set", tool="cp", args=["-a"], processes=1),
+               beside=("local", "nfs", "memory")),
+    "rsync": dict(variant=dict(id="rsync-a", description="rsync -a of the file set", tool="rsync", args=["-a"],
+                               processes=1),
+                  beside=COPIES),
+}
+# their cells. A reference cell is named after the copy cell it stands beside and its tool, as
+# `local-cp`: it copies what that cell copies, and that cell's copies set its time limit
+REFERENCES = {copies + "-" + tool: dict(variant=cell["variant"], tool=tool, beside=copies)
+              for tool, cell in REFERENCE_RUNS.items() for copies in cell["beside"]}
+# how many times the median of rcp's copies a copy by another tool may take, unless a run is told
+REFERENCE_LIMIT = 10
+SCENARIOS = (*COPIES, *TOOLS, *REFERENCES)
+# how each scenario reaches its data: directly, or over this host's loopback, as rcp's remote copy
+# does through rcpd and rsync's pull through sshd
+TOPOLOGY = {scenario: "loopback" if "remote" in (scenario, REFERENCES.get(scenario, {}).get("beside")) else "local"
+            for scenario in SCENARIOS}
 
 
 def storage_of(scenario):
-    """Where a scenario keeps its trees: a tool cell works where the copies it follows are.
+    """Where a scenario keeps its trees.
 
-    A copy scenario that names no storage is on the disks.
+    A tool cell works where the copies it follows are, and a reference cell where the copies it
+    stands beside are. A copy scenario that names no storage is on the disks.
     """
-    return STORAGE.get(TOOLS[scenario]["follows"] if scenario in TOOLS else scenario, "disks")
+    named = (TOOLS[scenario]["follows"] if scenario in TOOLS else
+             REFERENCES[scenario]["beside"] if scenario in REFERENCES else scenario)
+    return STORAGE.get(named, "disks")
+
+
+def reference_command(variant, executable, source, destination, host=None):
+    """The copy of a tree that another tool makes, into a place that does not exist yet.
+
+    cp is given the tree and its copy. rsync copies what is in one directory into another, which
+    the trailing slashes say, and pulls the tree from `host` when one is named: the rsync that the
+    host runs is this one, wherever a session there would look for it.
+    """
+    if variant["tool"] == "cp":
+        return [executable, *variant["args"], str(source), str(destination)]
+    there = [f"--rsync-path={executable}", f"{host}:{source}/"] if host else [f"{source}/"]
+    return [executable, *variant["args"], *there, f"{destination}/"]
 # what clears the trees of a run: its own rrm when it times one, the system's rm otherwise
 REMOVALS = ("rrm", "rm -rf")
 PURPOSES = ("performance", "commissioning")
@@ -220,6 +266,11 @@ def _arguments(argv):
     parser.add_argument("--sshd", type=Path, help="sshd for remote cells; by default the one on PATH or in /usr/sbin")
     parser.add_argument("--ssh", type=Path, help="ssh client for remote cells; by default the one on PATH")
     parser.add_argument("--ssh-keygen", type=Path, help="ssh-keygen for remote cells; by default the one on PATH")
+    parser.add_argument("--cp", type=Path, help="cp for reference cells; by default the one on PATH")
+    parser.add_argument("--rsync", type=Path, help="rsync for reference cells; by default the one on PATH")
+    parser.add_argument("--reference-limit", type=float, default=REFERENCE_LIMIT,
+                        help="a copy by cp or rsync is cut off after this many times the median of rcp's copies "
+                             "in the cell beside it")
     parser.add_argument("--runner-label", default="local")
     parser.add_argument("--purpose", choices=PURPOSES, default="performance")
     parser.add_argument("--output", type=Path, required=True)
@@ -247,10 +298,14 @@ def selection(manifest, cells):
         selected.append((case_id, scenario))
     if len(selected) > MAX_CELLS:
         raise ValueError("too many cells")
-    for case_id, scenario in selected:
+    for position, (case_id, scenario) in enumerate(selected):
         if scenario in TOOLS and (case_id, TOOLS[scenario]["follows"]) not in selected:
             raise ValueError(f"a tool cell needs the {TOOLS[scenario]['follows']} cell of its file set: "
                              f"{case_id}:{scenario}")
+        # the copies of the cell beside a reference cell set its time limit, so they are made first
+        if scenario in REFERENCES and (case_id, REFERENCES[scenario]["beside"]) not in selected[:position]:
+            raise ValueError(f"a reference cell needs the {REFERENCES[scenario]['beside']} cell of its file set "
+                             f"before it: {case_id}:{scenario}")
     for case_id in cases:
         homes = sorted({HOME[storage_of(scenario)] for other, scenario in selected if other == case_id})
         if len(homes) > 1:
@@ -290,8 +345,17 @@ def storages(planned, args):
 
 
 def _variant(scenario, variant):
-    """What a cell of this scenario runs: its tool for a tool cell, the manifest's copy otherwise."""
-    return copy.deepcopy(TOOLS[scenario]["variant"]) if scenario in TOOLS else variant
+    """What a cell of this scenario runs: its tool for a tool cell or a reference cell, the manifest's copy otherwise."""
+    cells = TOOLS if scenario in TOOLS else REFERENCES if scenario in REFERENCES else None
+    return variant if cells is None else copy.deepcopy(cells[scenario]["variant"])
+
+
+def _system_tool(name, given):
+    """Where a tool that the system provides is: where the run was told, or on the search path."""
+    path = given or shutil.which(name)
+    if path is None:
+        raise ValueError(f"{name} is not on the search path; name it with --{name}")
+    return path
 
 
 def cell_id(case, scenario, variant, context):
@@ -319,9 +383,11 @@ def _persist(output, record, sampler=None):
     temporary = output / "results.json.tmp"
     temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     temporary.replace(output / "results.json")
-    lines = [f"# Benchmark matrix {record['run_id']}", "", f"Status: **{record['status']}**", "",
-             "Copies are not verified: a copy counts when the command exits zero and reports the expected "
-             "transfer counts. A run of rcmp, rlink or rrm counts the same way, on the counts of its own summary.", ""]
+    counting = ("Copies are not verified: a copy counts when the command exits zero and reports the expected "
+                "transfer counts. A run of rcmp, rlink or rrm counts the same way, on the counts of its own summary.")
+    if any(cell["scenario"] in REFERENCES for cell in record["cells"]):
+        counting += " A copy by cp or rsync counts on its exit status alone: neither tool says what it copied."
+    lines = [f"# Benchmark matrix {record['run_id']}", "", f"Status: **{record['status']}**", "", counting, ""]
     if record.get("error"):
         lines += [f"Error: {record['error']}", ""]
     lines += ["| File set | Scenario | Outcome | Median (s) | Min–max (s) | Runs | Note |",
@@ -484,6 +550,8 @@ def main(argv=None):
         raise ValueError(f"the manifest needs a single-process {VARIANT} variant with an exact transfer summary")
     if args.repetitions <= 0 or args.repetitions > MAX_COPIES or not math.isfinite(args.timeout) or args.timeout <= 0:
         raise ValueError(f"repetitions must be 1..{MAX_COPIES} and timeout finite and positive")
+    if not math.isfinite(args.reference_limit) or args.reference_limit <= 0:
+        raise ValueError("the reference limit must be finite and positive")
     for root in (args.source_root, args.destination_root):
         if not root.is_dir():
             raise ValueError(f"scratch parent does not exist: {root}")
@@ -501,6 +569,8 @@ def main(argv=None):
         repository=os.environ.get("GITHUB_REPOSITORY", ""), run_url=os.environ.get("BENCHMARK_RUN_URL", ""))
     if elsewhere:
         context["storages"] = elsewhere
+    if any(scenario in REFERENCES for _, scenario in planned):
+        context["reference_limit"] = args.reference_limit
     file_sets = []
     for case, _ in planned:
         if all(item["case"]["id"] != case["id"] for item in file_sets):
@@ -535,6 +605,10 @@ def main(argv=None):
         selected = [tool for tool in TOOL_RUNS
                     if any(TOOLS.get(scenario, {}).get("tool") == tool for _, scenario in planned)]
         tools = {name: run._tool(args.bin_dir.resolve() / name) for name in ("filegen", "rcp", "rcpd", *selected)}
+        # the reference cells run what the system provides, and it too is needed only when selected
+        for name in REFERENCE_RUNS:
+            if any(REFERENCES.get(scenario, {}).get("tool") == name for _, scenario in planned):
+                tools[name] = run._tool(_system_tool(name, getattr(args, name)))
         record["tools"] = tools
         paths = {name: tool["path"] for name, tool in tools.items()}
         # a run that times rrm clears its trees with it too, until rrm fails at one
@@ -935,14 +1009,29 @@ def main(argv=None):
             """Copy one cell's file set the configured number of times and settle the cell's outcome.
 
             `waiting` are the tool cells that work on each of these copies; `contents` is how many
-            files and directories the file set holds.
+            files and directories the file set holds. The copies of a reference cell are another
+            tool's: each has the run's multiple of what rcp took in the cell beside it, and the
+            first that takes longer ends the cell.
             """
             nonlocal ended, trial_index, unreachable
             copies, loopback = args.repetitions, remote(cell)
+            reference = REFERENCES.get(cell["scenario"])
             reason = barred(cell)
             if reason is not None:
                 settle([cell], "failed", *reason)
                 return
+            ceiling = None
+            if reference is not None:
+                beside = next(other for other in record["cells"]
+                              if (other["case_id"], other["scenario"]) == (cell["case_id"], reference["beside"]))
+                if beside["outcome"]["status"] != "complete":
+                    # as for a tool cell whose copies did not complete; an allocation that ended
+                    # there has settled this cell already
+                    settle([cell], beside["outcome"]["status"], "copy",
+                           f"the {reference['beside']} cell whose copies set this cell's time limit did not "
+                           f"complete: {beside['outcome']['message']}")
+                    return
+                ceiling = cell["limit_seconds"] = args.reference_limit * beside["summary"]["median"]
             for iteration in range(1, copies + 1):
                 limit = None if ended else allocation.limit(args.timeout)
                 if limit is None:
@@ -955,15 +1044,21 @@ def main(argv=None):
                 kind = storage_of(cell["scenario"])
                 destination = scratch[HOME[kind]][1] / trial
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                commands = run.plan_commands(variant, seen(source, kind, "source"),
-                                             seen(destination, kind, "destination"), paths, "local")
-                # output options go before the two operands
-                flags = progress_args("rcp") + ((SUMMARY_FORMAT,) if reports else ())
-                if flags:
-                    commands = [[*command[:-2], *flags, *command[-2:]] for command in commands]
+                if reference is None:
+                    commands = run.plan_commands(variant, seen(source, kind, "source"),
+                                                 seen(destination, kind, "destination"), paths, "local")
+                    # output options go before the two operands
+                    flags = progress_args("rcp") + ((SUMMARY_FORMAT,) if reports else ())
+                    if flags:
+                        commands = [[*command[:-2], *flags, *command[-2:]] for command in commands]
+                    if loopback:
+                        commands = [endpoint.command(command, paths["rcpd"]) for command in commands]
+                else:
+                    commands = [reference_command(reference["variant"], paths[reference["tool"]],
+                                                  seen(source, kind, "source"), seen(destination, kind, "destination"),
+                                                  private_sshd.ADDRESS if loopback else None)]
                 restarted = False
                 if loopback:
-                    commands = [endpoint.command(command, paths["rcpd"]) for command in commands]
                     try:
                         restarted = endpoint.ensure()
                     except InterruptedError:
@@ -984,6 +1079,13 @@ def main(argv=None):
                     limit = cool(case_index, cell, item, source, limit, "copy", copies)
                     if limit is None:
                         return
+                if ceiling is not None:
+                    # a reference copy's limit is its own, and may be longer than the one that catches hangs
+                    limit = allocation.limit(ceiling)
+                    if limit is None:
+                        ended = True
+                        settle([cell], "interrupted", "copy", f"allocation ended before copy {iteration} of {copies}")
+                        return
                 settle([cell], "interrupted", "copy", f"run stopped during copy {iteration} of {copies}")
                 save()
                 mark("command", case_index, item["trial_index"])
@@ -998,7 +1100,9 @@ def main(argv=None):
                     item["status"] = "interrupted" if ended else "timed_out"
                     settle([cell], item["status"], "copy",
                            f"allocation ended during copy {iteration} of {copies}" if ended else
-                           f"copy {iteration} did not finish within {args.timeout:g} s")
+                           f"copy {iteration} did not finish within {args.timeout:g} s" if ceiling is None else
+                           f"copy {iteration} did not finish within {ceiling:.1f} s, {args.reference_limit:g} times "
+                           f"the median of the {reference['beside']} cell")
                 elif not succeeded:
                     codes = outcome["exit_codes"]
                     item["status"] = "failed"
@@ -1009,6 +1113,9 @@ def main(argv=None):
                            (f"code {codes[0]}" if len(codes) == 1 else f"codes {codes}") +
                            # rcp reports what went wrong on its output; its argument parser on stderr
                            f"; see 0.stdout.log and 0.stderr.log in logs/{trial}")
+                elif reference is not None:
+                    # neither cp nor rsync says what it copied: its copy stands on its exit status
+                    item["status"] = "ok"
                 else:
                     # output is read as text with stand-ins for stray bytes: only the summary matters
                     text = run._read(outcome["logs"][0]["stdout"])
@@ -1241,7 +1348,7 @@ def _validate(record):
     tools = record.get("tools")
     # a run that stops before it has read its tools still reports, with none recorded
     _check(isinstance(tools, dict)
-           and set(tools) <= {"filegen", "rcp", "rcpd", *TOOL_RUNS} and all(
+           and set(tools) <= {"filegen", "rcp", "rcpd", *TOOL_RUNS, *REFERENCE_RUNS} and all(
         isinstance(tool, dict) and isinstance(tool.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", tool["sha256"])
         and _text(tool.get("path"), 4096) and _text(tool.get("version"), 4096) for tool in tools.values()),
         "invalid tools")
@@ -1267,8 +1374,8 @@ def _validate(record):
         _check(isinstance(cell.get("cell_id"), str) and re.fullmatch(r"[0-9a-f]{64}", cell["cell_id"]),
                f"{name}.cell_id must be a SHA256 hex digest")
         variant = cell.get("variant")
-        # a tool cell runs its tool; every other cell is a copy by the one copy variant
-        expected = TOOLS[cell["scenario"]]["variant"]["id"] if cell["scenario"] in TOOLS else VARIANT
+        # a tool cell and a reference cell run their tool; every other cell is a copy by the one copy variant
+        expected = _variant(cell["scenario"], dict(id=VARIANT))["id"]
         _check(isinstance(variant, dict) and variant.get("id") == expected and isinstance(variant.get("args"), list)
                and all(isinstance(argument, str) for argument in variant["args"]), f"{name}.variant is invalid")
         outcome = cell.get("outcome")
@@ -1308,6 +1415,27 @@ def _validate(record):
                    f"{name}.summary does not match its copies")
         else:
             _check(summary is None, f"{name} has a summary without completing")
+    # a run with reference cells says what multiple of rcp's time their copies were given, and each
+    # such cell that was measured was given that multiple of the median of the cell beside it
+    if any(cell["scenario"] in REFERENCES for cell in cells):
+        _number(context.get("reference_limit"), "context.reference_limit", positive=True)
+    else:
+        _check("reference_limit" not in context, "a run without reference cells names a reference limit")
+    for index, cell in enumerate(cells):
+        name = f"cells[{index}]"
+        if cell["scenario"] not in REFERENCES:
+            _check("limit_seconds" not in cell, f"{name} has a limit that only a reference cell has")
+            continue
+        beside = next((other for other in cells[:index] if (other["case_id"], other["scenario"]) ==
+                       (cell["case_id"], REFERENCES[cell["scenario"]]["beside"])), None)
+        _check(beside is not None, f"{name} has no copy cell beside it before it")
+        if "limit_seconds" in cell:
+            _number(cell["limit_seconds"], f"{name}.limit_seconds", positive=True)
+            _check(beside["outcome"]["status"] == "complete"
+                   and cell["limit_seconds"] == context["reference_limit"] * beside["summary"]["median"],
+                   f"{name}.limit_seconds is not the run's multiple of the median beside it")
+        else:
+            _check(not cell["copies"], f"{name} was measured without a limit")
     complete = sum(cell["outcome"]["status"] == "complete" for cell in cells)
     expected = "complete" if complete == len(cells) else "partial" if complete else "failed"
     # a stopped run reports "running" or "failed" whatever its finished cells say

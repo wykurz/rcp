@@ -697,7 +697,8 @@ just benchmark-matrix --manifest benchmarks/matrix-cases.json \
     --cache uncontrolled --output /tmp/matrix-results
 ```
 
-Four scenarios copy a file set, and twelve time another tool on a copy:
+Four scenarios copy a file set with rcp, twelve time another tool of the suite on a copy, and seven
+copy the file set with `cp` or `rsync` for reference:
 
 - **`local`** copies between two directories:
   `rcp --summary --output-format=json SOURCE DESTINATION`.
@@ -713,6 +714,9 @@ Four scenarios copy a file set, and twelve time another tool on a copy:
   that a `local` copy has just written, and **`remote-rcmp`**, **`remote-rlink`** and
   **`remote-rrm`** do the same after a `remote` copy. `nfs` and `memory` copies have theirs too
   (`nfs-rcmp`, `memory-rrm` and so on). See [Tool cells](#tool-cells).
+- **`local-cp`**, **`local-rsync`** and **`remote-rsync`** copy the file set of the cell they are
+  named after with `cp -a` or `rsync -a`; `nfs` and `memory` copies have theirs too. See
+  [Reference cells](#reference-cells).
 
 `benchmarks/matrix-cases.json` holds the file sets that a cell can name. Two small ones exercise
 every step in seconds (`commission-64m`, `commission-10k`). The weekly AWS suite has file sets sized
@@ -1025,6 +1029,31 @@ again (`endpoint_restarted` on the next copy); if that fails, the remaining remo
 
 `python3 -m benchmarks.private_sshd` starts the endpoint, logs in once and stops: a quick check that
 a machine can serve remote cells. When it fails it prints the reason and the end of sshd's log.
+
+### Reference cells
+
+A reference cell copies a file set with `cp -a` or `rsync -a`, to say what those take where rcp's
+copy has just been timed. It is named after the copy cell it stands beside and its tool: `local-cp`,
+`local-rsync`, `remote-rsync`, and the same for `nfs` and `memory` copies. cp does not copy from a
+host, so there is no `remote-cp`; beside remote copies rsync pulls the file set over SSH, through
+the private sshd of the [remote cells](#remote-cells).
+
+```bash
+just benchmark-matrix --manifest benchmarks/matrix-cases.json \
+    --cell commission-10k:local --cell commission-10k:local-cp --cell commission-10k:local-rsync \
+    --bin-dir target/release --source-root /mnt/source --destination-root /mnt/destination \
+    --cache uncontrolled --output /tmp/matrix-results
+```
+
+- **After rcp.** The copy cell comes before its reference cells in the selection. The tools are the
+  system's `cp` and `rsync` (`--cp` and `--rsync` name others), and a cache is dropped before each
+  of their copies wherever one is dropped before rcp's.
+- **The limit.** A reference copy gets ten times the median of rcp's copies in the cell beside it
+  (`--reference-limit`), in place of `--timeout`. A copy that is cut off there ends its cell as
+  `timed_out` and the cell is not tried again: on some file sets these tools take many times what
+  rcp takes, and how many times is not worth hours.
+- **What counts.** Neither tool says what it copied or what it used, so a reference copy counts on
+  its exit status alone and has no CPU or memory figures.
 
 ## Results and history
 
