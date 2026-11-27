@@ -546,8 +546,10 @@ Manual deployment is still supported and may be preferred for:
 - `--remote-transport` - source↔destination transport mode: `tcp` (default, fastest), `ssh` (tunnel
   traffic over SSH without opening extra firewall ports), or `auto` (try direct TCP first, fall back
   to SSH on failure)
-- `--ssh-tunnels` - parallel SSH tunnels for SSH data transport (default: 4, degrades gracefully
-  down to 1)
+- `--ssh-tunnels` - parallel SSH tunnels for SSH data transport (default: the smaller of the
+  effective stream count and 16). An explicit count is still bounded by the effective stream count;
+  if extra tunnels can't be opened, the transfer can use as few as one. Dry runs use one tunnel for
+  control only.
 - `--ssh-forward-agent` - forward the local SSH agent to the destination host for 3-host SSH copies
 - `--remote-direct-probe-timeout-sec` - direct-TCP probe timeout in seconds before falling back to
   SSH in `--remote-transport=auto` (default: 3)
@@ -571,22 +573,18 @@ For detailed network connectivity and troubleshooting information, see `docs/rem
 
 ## Security
 
-**Remote copy uses SSH for authentication and TLS 1.3 for encrypted data transfer.**
+Remote copy uses SSH to authenticate and start the daemons and to carry orchestration and tracing.
+Source-to-destination encryption depends on the transport:
 
-**Security Model:**
+- **Direct TCP (default)** uses mutual TLS 1.3 with certificate fingerprint pinning for control and
+  data.
+- **SSH transport** uses SSH for wire encryption. Normally, the daemons mutually authenticate the
+  forwarded connections without a second layer of encryption. See the
+  [remote copy guide](docs/remote_copy.md#port-configuration--ssh-data-transport) for details,
+  including `auto` fallback.
 
-- **SSH Authentication**: All remote operations require SSH authentication first
-- **TLS Encryption**: Data transfers are encrypted by default using TLS 1.3 with certificate pinning
-- **Mutual Authentication**: Both source and destination verify each other's certificates
-
-**What's Protected:**
-
-- ✅ Unauthorized access (SSH authentication required)
-- ✅ Data encryption (TLS 1.3 with AES-256-GCM)
-- ✅ Man-in-the-middle attacks (certificate fingerprint verification)
-
-**Performance Option:** For trusted networks where encryption overhead is undesirable, use
-`--no-encryption`:
+**Performance Option:** For isolated, trusted networks where direct TCP encryption overhead is
+undesirable, use `--no-encryption`:
 
 ```fish
 > rcp --no-encryption source:/path dest:/path
@@ -595,7 +593,8 @@ For detailed network connectivity and troubleshooting information, see `docs/rem
 Warning: This disables both encryption and authentication on Source↔Destination TCP connections
 (control and data) — not just the file-data path. The source's TCP listeners then accept connections
 from anyone who can reach their ports. Master↔rcpd control and tracing continue to run inside the
-authenticated SSH exec channel (no master-facing TCP listener is opened).
+authenticated SSH exec channel (no master-facing TCP listener is opened). If the data path uses SSH,
+the tunnel still encrypts traffic on the wire, but the daemon peer-authentication check is disabled.
 
 **Best Practices:**
 
