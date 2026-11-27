@@ -1058,6 +1058,34 @@ class ReportSiteTests(unittest.TestCase):
         self.assertIn('400 files of 1 GB each (400 GB), copied locally by rcp with default settings · 1 run</p>', current)
         self.assertIn('1,000 files of 1 GB each (1 TB), copied locally by rcp with default settings · 2 runs</p>', earlier)
 
+    def test_a_run_page_says_where_its_time_went_and_the_list_of_runs_how_long_each_run_took(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        from infra.aws_benchmark.test_time_use import RUN_LEVEL, marked, phase
+        # three copies of ten minutes, and ten and a half minutes around them
+        runs = [marked('matrix-1g-local', RUN_LEVEL, lambda trial: [phase('command', 600.0)]),
+                matrix_example('matrix-1g-local', run='43200000002', at='2026-11-27T08:30:00+00:00')]
+        pages = report_site.render_aws_benchmarks(
+            {record['run_key']: production_export.collection.encoded(record) for record, _ in runs},
+            diagnostics={record['run_key']: extra for record, extra in runs})
+        timed, plain = (pages[Path('aws-benchmarks/runs/repo-655073755-run-4320000000' + run + '.html')]
+                        for run in '12')
+        # the section is reached from the navigation of its page, where it stands on the page
+        links = ('<li class="level-h3"><a href="#results">Results</a></li>'
+                 '<li class="level-h3"><a href="#time-use">Where the time went</a></li>'
+                 '<li class="level-h3"><a href="#resource-diagnostics">Resource diagnostics</a></li>')
+        self.assertIn(links, timed)
+        self.assertIn("<h2 id='time-use'>Where the time went</h2>", timed)
+        # a run that marked no phase has no section, and no link to one
+        self.assertNotIn('time-use', plain)
+        self.assertIn(links.replace('<li class="level-h3"><a href="#time-use">Where the time went</a></li>', ''), plain)
+        index = pages[Path('aws-benchmarks/index.html')]
+        self.assertIn('<th>Commit</th><th>Took</th><th>Collected</th>', index)
+        self.assertIn('</code></a></td><td><a href="runs/repo-655073755-run-43200000001.html#time-use">40 min 31 s</a>'
+                      '</td><td><time ', index)
+        self.assertIn('</code></a></td><td>—</td><td><time ', index)
+
     def test_a_site_with_two_generations_of_file_sets_has_no_dangling_link(self):
         from infra.aws_benchmark.production_publish import inventory
         from infra.aws_benchmark.test_matrix_pages import matrix_example

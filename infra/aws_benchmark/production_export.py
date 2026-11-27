@@ -244,6 +244,7 @@ def render(value, *, diagnostics=None):
                 "</code></td></tr>" for item in value["measurements"]) + "</tbody></table></div>")
     html += "</section>"
     if diagnostics is not None:
-        html += resource_diagnostics.render(diagnostics, value)
+        html += (history.time_use_html(resource_diagnostics.time_use(diagnostics, value)) +
+                 resource_diagnostics.render(diagnostics, value))
     require(len(html.encode()) <= MAX_PUBLIC_HTML, "rendered public HTML exceeds bound")
     return html

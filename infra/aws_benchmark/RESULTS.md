@@ -402,6 +402,20 @@ share of the time each array was busy and the share of processor time that was b
 come from each copy's sampled command phase in the resource diagnostics, over the time from that
 phase's first sample to its last; no record or diagnostics format changes.
 
+A run page says where the run's time went. Under *Where the time went* it gives the time the
+worker's harness recorded, split between the commands the run times and what it does around them,
+and a row for each kind of work with its time and its share of the run: each kind of copy, each
+tool, generating the file sets, emptying the page cache, removing the copies, removing the trees
+that `rlink` made, and removing each file set. The bars beside the shares are in proportion, the
+longest as long as its column. A run that times `rrm` has no row for removing its copies and says
+why: each copy is removed by a run of `rrm` that the run times. A matrix run also has a row for each
+file set. The list of runs on the AWS benchmarks page gives each run's total under *Took*. The times
+are those of the sampled phases in the resource diagnostics: a phase lasts from the moment the
+harness marks it to its next mark, so the phases cover the harness from its start to its end.
+Starting the machine and preparing its storage come before the harness and are not counted. A run
+that marked no phase has no such section, and one with a step that recorded none says that it took
+longer than its total. No record or diagnostics format changes.
+
 The raw evidence behind any run page is retained for 90 days and can be fetched and verified with
 `just aws-benchmark-evidence`; see
 [Find the evidence of a run](PRODUCTION.md#find-the-evidence-of-a-run).

@@ -404,6 +404,17 @@ def plural(count, one, many):
     return f"{count} {one if count == 1 else many}"
 
 
+def span(seconds):
+    """Give a length of time in the two units that matter at its size; below a minute, to a tenth of a second."""
+    if seconds < 59.95:
+        return f"{seconds:.1f} s"
+    whole = int(seconds + .5)
+    if whole < 3600:
+        return f"{whole // 60} min {whole % 60:02d} s"
+    minutes = int(seconds / 60 + .5)
+    return f"{minutes // 60} h {minutes % 60:02d} min"
+
+
 def _value_axis(points, metric):
     """Fit the value axis to the data, never tighter than ±5% of its centre."""
     # a frozen median is not required to lie between its samples, so it is part of the fit
@@ -919,6 +930,87 @@ def storage_html(run, href, rows, sets):
             ("; a tool run shorter than that has no figures" if tools else "") + ". Busy is the share of that time "
             "during which the array had a request in progress. CPU busy is the share of all processors' time that "
             "was neither idle nor waiting for I/O.</p>")
+
+
+# what a run does around the commands it times, as `diagnostics.time_use` names each kind of it
+AROUND = {"generation": "Generating the file sets", "cache": "Emptying the page cache before a command",
+          "copies": "Removing the copies", "links": "Removing the trees that rlink made",
+          "file_sets": "Removing each file set and what was left of its copies",
+          "checks": "Checking the file sets and the copies", "other": "Other steps"}
+# how long the longest bar of a table is, in the units of its drawing
+SHARE_WIDTH = 160
+
+
+def _bar(length):
+    """Draw a bar from the left edge, `length` of the longest one: square where it starts, round where it ends.
+
+    A bar too short for a round end is a plain sliver, and nothing at all has no bar.
+    """
+    width = length * SHARE_WIDTH
+    if width <= 0:
+        return ""
+    mark = (f"<path class='bar' d='M0,1h{width - 4:.2f}a4,4 0 0 1 0,8H0z'/>" if width >= 4 else
+            f"<rect class='bar' y='1' width='{width:.2f}' height='8'/>")
+    # the row gives the same share in figures, so the drawing is not read out a second time
+    return (f"<svg class='share' width='{SHARE_WIDTH}' height='10' viewBox='0 0 {SHARE_WIDTH} 10' "
+            f"aria-hidden='true'>{mark}</svg>")
+
+
+def time_use_html(use):
+    """Say where one run's time went: each kind of work with its share of the run, then each file set.
+
+    `use` is that of `diagnostics.time_use`; a run without one has no section. The kinds of work
+    stand in two halves, the commands the run times and what it does around them, the largest
+    first in each: bars from one edge compare more exactly than the segments of a single bar. The
+    bars of both halves are in proportion, and the longest fills its column: a run of many kinds
+    of work would otherwise have no bar long enough to compare.
+    """
+    if use is None:
+        return ""
+    total = use["total"]
+    part = lambda seconds: seconds / total if total else 0
+    figures = lambda seconds: ("<td class='number'>" + span(seconds) + "</td><td class='number'>" +
+                               f"{100 * part(seconds):.1f}%</td>")
+    name = lambda key, names: escape(names[key]) if key in names else "<code>" + escape(key) + "</code>"
+    timed, around = sum(use["commands"].values()), sum(use["around"].values())
+    longest = max([*use["commands"].values(), *use["around"].values()])
+    html = ("<section aria-labelledby='time-use'><h2 id='time-use'>Where the time went</h2>"
+            "<p>The worker's harness recorded <strong>" + span(total) + "</strong> of work in this run: " +
+            span(timed) + f" ({100 * part(timed):.1f}%) in the commands it times and " + span(around) +
+            f" ({100 * part(around):.1f}%) around them." +
+            ("" if use["complete"] else " Some of its steps recorded no phase, so the run took longer than that.") +
+            "</p><div class='table-scroll'><table class='data'><thead><tr><th>Work</th><th class='number'>Time</th>"
+            "<th colspan='2'>Share of the run</th></tr></thead>")
+    titles = {trend: row[0] for trend, row in ROWS.items()}
+    for heading, parts, names in (("Commands the run times", use["commands"], titles),
+                                  ("Around them", use["around"], AROUND)):
+        if not parts:
+            continue
+        # each half is a group of rows under its heading, as the groups of the setup table are
+        html += "<tbody><tr><th colspan='4' scope='rowgroup'>" + heading + "</th></tr>"
+        for key, seconds in sorted(parts.items(), key=lambda item: -item[1]):
+            html += ("<tr><td>" + name(key, names) + "</td>" + figures(seconds) + "<td>" +
+                     _bar(seconds / longest if longest else 0) + "</td></tr>")
+        html += "</tbody>"
+    html += "</table></div>"
+    if use["cases"]:
+        html += ("<h3>By file set</h3><div class='table-scroll'><table class='data'><thead><tr><th>File set</th>" +
+                 "".join("<th class='number'>" + title + "</th>" for title in (
+                     "Commands", "Generating it", "The rest", "Together", "Share of the run")) +
+                 "</tr></thead><tbody>")
+        for case in use["cases"]:
+            together = case["commands"] + case["generation"] + case["rest"]
+            html += ("<tr><td>" + name(case["case_id"], NAMES) + "</td>" + "".join(
+                "<td class='number'>" + span(case[key]) + "</td>" for key in ("commands", "generation", "rest")) +
+                figures(together) + "</tr>")
+        html += "</tbody></table></div>"
+    return (html + "<p class='reading'>A phase lasts from the moment the harness marks it to its next mark" +
+            (", so the phases cover the harness from its start to its end" if use["complete"] else "") +
+            ". Starting the machine and preparing its storage come before the harness and are not in these times." +
+            # a run that times rrm has no row for removing its copies: the runs of rrm are that removal
+            (" Each copy of this run is removed by a run of rrm that the run times: removing the copies is in the row "
+             "of rrm." if "rrm" in use["commands"] and "copies" not in use["around"] else "") +
+            "</p></section>")
 
 
 def reading_html(remote=False, tools=False, sized=False):
