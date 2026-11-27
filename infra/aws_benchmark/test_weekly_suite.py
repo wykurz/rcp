@@ -79,6 +79,7 @@ class WeeklySuiteTests(unittest.TestCase):
     def test_it_follows_the_suites_there_were(self):
         self.assertEqual(common.DURABLE_SUITES[47:], (FIRST, WEEKLY))
         self.assertEqual(len(common.MATRIX_SUITES), 44)
+        self.assertEqual(common.MATRIX_WEEKLY, WEEKLY)
         # its cells never change: another choice of file sets or scenarios is another suite, with the next number
         self.assertRegex(WEEKLY, r"^matrix-weekly-[1-9][0-9]*$")
         # what the schedule runs is changed in a step of its own, after this suite has run by hand

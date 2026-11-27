@@ -380,16 +380,21 @@ also says how that storage is made. The rows, pages and trends of the arrays are
 
 The pages show one generation of file sets as the current one. Until a run of
 [the weekly suite](PRODUCTION.md#the-weekly-suite) has measured something, that is the generation
-described above. From then on it is that suite's: 400 GB of 1 GB, of 100 MB and of 1 MB files, and
-4,096,000 files of 1 KB on the arrays and in memory. The AWS benchmarks page, the page of each kind
-of copy and of each tool and the test setup page then show and describe those file sets. A copy of
-400 GB and a copy of a terabyte are different measurements, so their runs are never on one line.
-Each page of a kind of copy or of a tool keeps the trends of the file sets before, with their data
-tables, under a collapsed *Earlier file sets* at its end, and a later run of an earlier suite still
-adds its points there. The file set on NFS is the same in both generations, so its trends continue.
-A tool's page then plots the sets of 1 KB files only, where the weekly suite times it, and says so.
-A run page summarizes its run on the file sets that run measured, whichever they are. The test setup
-page tabulates what the arrays did during the newest run on the current file sets. No record or
+described above. From then on it is that suite's: 200 GB of 1 GB and of 1 MB files, and 2,048,000
+files of 1 KB on the arrays and in memory. The AWS benchmarks page, the page of each kind of copy
+and of each tool and the test setup page then show and describe those file sets. A copy of 200 GB
+and a copy of a terabyte are different measurements, so their runs are never on one line. Each page
+of a kind of copy or of a tool keeps the trends of the file sets before, with their data tables,
+under a collapsed *Earlier file sets* at its end, and a later run of an earlier suite still adds its
+points there. The set of 100 MB files has no successor: its trends are among the earlier ones. The
+file set on NFS is the same in both generations, so its trends continue. A tool's page then plots
+the sets of 1 KB files only, where the weekly suite times it, and says so. On the arrays the weekly
+suite times `rcmp` and `rlink` after the local copies only, so a point of theirs holds three runs
+where a point of `rrm` holds six, and the line under a file set says after which copies the tool
+ran. The file sets of `matrix-weekly-1`, the weekly suite that was defined first and never ran, are
+of no generation: should it run, its measurements are on its run page and in no trend. A run page
+summarizes its run on the file sets that run measured, whichever they are. The test setup page
+tabulates what the arrays did during the newest run on the current file sets. No record or
 diagnostics format changes for this.
 
 The test setup page says what the storage allows. Each array is two of the machine's four NVMe

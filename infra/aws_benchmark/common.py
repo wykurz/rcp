@@ -200,8 +200,8 @@ _WEEKLY_SUITES = {
         *(("tiny-1k-700x1024", scenario) for scenario in ("nfs", *_NFS_TOOLS)),
         *(("tiny-1k-2048k-memory", scenario) for scenario in ("memory", *_MEMORY_TOOLS)))}
 MATRIX_WEEKLY_SUITES = tuple(_WEEKLY_SUITES)
-# the one whose file sets the pages show once it has run
-MATRIX_WEEKLY = "matrix-weekly-1"
+# the one that is meant to run, and whose file sets the pages show once it has
+MATRIX_WEEKLY = "matrix-weekly-2"
 # four and a half hours of work were expected of the first and about two are of the second: the
 # eight-hour allocation that the copies of every file set had, with its reservation. The bill
 # follows the time a run takes, not its allocation

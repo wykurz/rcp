@@ -100,6 +100,9 @@ class FileSets:
     most_files: str
     # whether the tools are timed on the file sets that their pages leave out
     timed: bool
+    # the tools that follow only the local copies of a file set of the arrays; the others follow
+    # every copy there. A remote copy leaves the tree that a local one leaves
+    local_only: tuple = ()
 
 
 # the file sets there were first: a terabyte of large files, ten million small ones, and the tools
@@ -115,16 +118,17 @@ FIRST = FileSets(
              "rrm": ("bulk-1g-1tb", "bulk-100m-1024gb", "bulk-1m-1024gb", "tiny-1k-10240k", "tiny-1k-700x1024",
                      "tiny-1k-10240k-memory")},
     most_files="tiny-1k-10240k", timed=True)
-# the file sets of the weekly suite (common.MATRIX_WEEKLY): those before them made smaller, so
-# that a command takes one to five minutes, and the tools timed on the sets of small files only.
-# The mounts of the network filesystem show the same file set as before
+# the file sets of the weekly suite (common.MATRIX_WEEKLY): those before them made five times
+# smaller, so that a command takes a minute or two, without the set of 100 MB files, which gave
+# what the set of 1 GB files gave, and with the tools timed on the sets of small files only. The
+# mounts of the network filesystem show the same file set as before. A weekly suite was defined
+# before this one and never ran (matrix-weekly-1): its file sets have no place on the pages
 SIZED = FileSets(
-    cases={"bulk-1g-400gb": "1 GB files", "bulk-100m-400gb": "100 MB files", "bulk-1m-400gb": "1 MB files",
-           "tiny-1k-4096k": "1 KB files"},
-    other={"tiny-1k-700x1024": "1 KB files on NFS", "tiny-1k-4096k-memory": "1 KB files in memory"},
-    plotted={NFS: ("tiny-1k-700x1024",), MEMORY: ("tiny-1k-4096k-memory",),
-             **{tool: ("tiny-1k-4096k", "tiny-1k-700x1024", "tiny-1k-4096k-memory") for tool in TOOLS}},
-    most_files="tiny-1k-4096k", timed=False)
+    cases={"bulk-1g-200gb": "1 GB files", "bulk-1m-200gb": "1 MB files", "tiny-1k-2048k": "1 KB files"},
+    other={"tiny-1k-700x1024": "1 KB files on NFS", "tiny-1k-2048k-memory": "1 KB files in memory"},
+    plotted={NFS: ("tiny-1k-700x1024",), MEMORY: ("tiny-1k-2048k-memory",),
+             **{tool: ("tiny-1k-2048k", "tiny-1k-700x1024", "tiny-1k-2048k-memory") for tool in TOOLS}},
+    most_files="tiny-1k-2048k", timed=False, local_only=("rcmp", "rlink"))
 # oldest first. The pages show one generation as the current one: see `generation`
 GENERATIONS = (FIRST, SIZED)
 # what every file set with a trend is called
@@ -625,6 +629,11 @@ def _reading(scenario):
             "to the slowest " + each + ". <a href='setups.html#reading'>How to read these plots</a>.</p>")
 
 
+def _local_only(case, tool):
+    """Whether a tool follows only the local copies of this file set, which is then one of the arrays."""
+    return any(case in sets.cases and tool in sets.local_only for sets in GENERATIONS)
+
+
 def _file_set(case, points, scenario):
     shape = diagnostics.MATRIX_CASE_SHAPES[case]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
@@ -633,7 +642,8 @@ def _file_set(case, points, scenario):
            f"the server costs {2 * diagnostics.CONFIGURED_STORAGE['nfs_delay_microseconds'] / 1000:g} ms"
            if scenario == NFS else
            "copied by rcp with default settings between two filesystems in memory" if scenario == MEMORY else
-           ACTIONS[scenario] + " after each copy" if scenario in TOOLS else
+           ACTIONS[scenario] + (" after each local copy" if _local_only(case, scenario) else " after each copy")
+           if scenario in TOOLS else
            "copied by rcp through a source and a destination rcpd over loopback, with default settings")
     html = ("<section id='history-" + case + "' aria-labelledby='history-" + case + "-title'>"
         "<h2 id='history-" + case + "-title'>" + NAMES[case] + "</h2><p class='dataset'>" +
@@ -697,8 +707,8 @@ def _render(cases, outside, limit, unmeasured, scenario, several, sets, earlier)
     if earlier:
         # the trends that ended when the file sets were replaced: kept, and out of the way
         html += ("<details class='earlier'><summary>Earlier file sets</summary><p class='window'>These file sets were "
-                 "measured until the weekly suite replaced them with smaller ones, so that a command takes one to "
-                 "five minutes. Their numbers are not comparable with those above.</p>" +
+                 "measured until the weekly suite replaced them with smaller ones, so that a command takes a "
+                 "minute or two. Their numbers are not comparable with those above.</p>" +
                  "".join(_file_set(case, points, scenario) for case, points in earlier.items()) + "</details>")
     return html + "</section>"
 
@@ -811,9 +821,14 @@ def _tools_row(windows, most_files):
     """The row of the other tools: each on the one file set where it has the most to do."""
     shape = diagnostics.MATRIX_CASE_SHAPES[most_files]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
+    # what the tiles have in common: the file set, and after which of its copies each tool runs
+    local = [tool for tool in TOOLS if _local_only(most_files, tool)]
+    after = (", after each copy" if not local else
+             ": " + " and ".join(local) + " after each local copy, " +
+             " and ".join(tool for tool in TOOLS if tool not in local) + " after every copy")
     return ("<section id='overview-tools' aria-labelledby='overview-tools-title'>"
             "<div class='overview-title'><h2 id='overview-tools-title'>Other tools</h2><span>" +
-            f"{files:,} files of {_decimal(shape['file_size_bytes'])}, after each copy" + "</span></div>"
+            f"{files:,} files of {_decimal(shape['file_size_bytes'])}" + after + "</span></div>"
             "<div class='overview'>" + "".join(
                 _tool_tile(scenario, windows[scenario][most_files], most_files)
                 for scenario in TOOLS if scenario in windows) +
@@ -974,7 +989,7 @@ def reading_html(remote=False, tools=False, sized=False):
         "centre, so it does not start at zero and small run-to-run noise stays flat.</li>"
         "<li><strong>Copy duration.</strong> Copy wall time. Fixture generation, cache preparation, validation "
         "and cleanup are outside it. For the " + (
-            "sets of 1 GB, 100 MB and 1 MB files" if sized else "terabyte file sets") +
+            "sets of 1 GB and 1 MB files" if sized else "terabyte file sets") +
         " it cannot be shorter than the destination array "
         "allows: see <a href='#storage'>What the storage allows</a>.</li>"
         "<li><strong>CPU time.</strong> User plus system seconds, added for each copy before the median is "
