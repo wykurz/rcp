@@ -267,7 +267,7 @@ class Endpoint:
         (directory / "authorized_keys").write_text((directory / "identity.pub").read_text())
         (directory / "authorized_keys").chmod(0o600)
         (directory / "bin").mkdir(mode=0o700)
-        # rcp passes StrictHostKeyChecking=no; the first value given wins, so the key stays checked
+        # enforce strict host-key verification before any caller options (first value wins)
         # keep launcher bytes stable across runs; the harness fingerprints its executable
         self._script(directory / "bin" / "ssh",
                      'directory=${0%/*}\n'

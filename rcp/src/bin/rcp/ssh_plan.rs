@@ -687,22 +687,21 @@ impl MasterSshTunnelPlan<'_> {
             self.client_address_family,
             node_endpoint,
         );
-        remote::ssh_tunnel::SshTunnelSet::open_on_existing_session(
-            self.direction,
-            &self.endpoint.control_path(),
-            self.endpoint.remote(),
-            self.target_control,
-            self.target_data,
-            self.requested_tunnels,
-            listen_address_family,
-            expected_peer.as_ref(),
-            node_endpoint,
-            self.keepalive_sec,
-            self.timeout,
-            self.cleanup,
-            self.local_operand_roots,
-        )
-        .await
+        self.endpoint
+            .open_ssh_tunnels(
+                self.direction,
+                self.target_control,
+                self.target_data,
+                self.requested_tunnels,
+                listen_address_family,
+                expected_peer.as_ref(),
+                node_endpoint,
+                self.keepalive_sec,
+                self.timeout,
+                self.cleanup,
+                self.local_operand_roots,
+            )
+            .await
     }
 }
 
@@ -789,6 +788,7 @@ mod tests {
                 },
                 forward_agent_enabled: false,
                 address_family: remote::ssh_tunnel::SshAddressFamily::Any,
+                strict_host_key_checking: remote::ssh_tunnel::SshStrictHostKeyChecking::Ask,
                 proxy_jump: None,
                 proxy_command: None,
             }
@@ -917,6 +917,7 @@ mod tests {
                 },
                 forward_agent_enabled: false,
                 address_family: af,
+                strict_host_key_checking: remote::ssh_tunnel::SshStrictHostKeyChecking::Ask,
                 proxy_jump: None,
                 proxy_command: None,
             }

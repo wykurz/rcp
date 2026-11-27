@@ -172,23 +172,36 @@ User
 2. **SSH infrastructure**: SSH keys, known_hosts, and SSH daemon security
 3. **Remote hosts**: Hosts accessible via SSH are trusted to run rcpd
 
-### SSH Host Verification Limitation
+### SSH Host-Key Verification
 
-When agent forwarding is disabled (the default), the SSH launcher in
-[`remote/src/lib.rs`](../remote/src/lib.rs) passes `StrictHostKeyChecking=no`. It does not enforce
-strict known-host verification, even if the user's SSH configuration requests it. TLS pinning checks
-the fingerprint supplied through that SSH session; it cannot independently establish that the
-bootstrap peer is the intended host. An attacker who can impersonate the SSH bootstrap peer can
-therefore supply the fingerprints that subsequent TLS connections trust. Do not treat TLS pinning as
-protection against that bootstrap attack.
+The SSH launcher in [`remote/src/lib.rs`](../remote/src/lib.rs) never passes
+`StrictHostKeyChecking=no`. All SSH connections run non-interactively with `BatchMode=yes`, and
+host-key verification follows `~/.ssh/config`:
 
-For 3-host SSH copies where SSH agent forwarding is active on the destination (`--ssh-forward-agent`
-or `ForwardAgent` enabled in `~/.ssh/config`), `rcp` authenticates the destination up front under
-the user's configured `StrictHostKeyChecking` policy (omitting `StrictHostKeyChecking=no`) before
-any source SSH connection can update `known_hosts` (even across distinct routes sharing an OpenSSH
-`HostKeyAlias`), and retains that verified master session across destination `~` home expansion
-(with agent forwarding disabled) and `rcpd` setup so the signing agent is never delegated to an
-unknown or unverified destination host.
+- **Non-agent-forwarded connections (master ↔ remote, extra parallel tunnels, and 3-host destination
+  → source tunnels)**: `rcp` inspects the host's effective `StrictHostKeyChecking` setting via
+  `ssh -G`:
+  - When OpenSSH reports its interactive default `ask` (which always fails non-interactively under
+    `BatchMode=yes`), `rcp` passes `-o StrictHostKeyChecking=accept-new` (Trust On First Use): a
+    previously unseen host key is accepted and recorded in `known_hosts`, while any changed or
+    mismatched host key fails closed.
+  - When `~/.ssh/config` sets an explicit policy (`yes`, `accept-new`, or `no`) — or when `ssh -G`
+    fails or returns an unrecognized token — `rcp` omits `-o StrictHostKeyChecking=...` so the
+    user's OpenSSH configuration applies untouched (failing safe).
+- **Agent-forwarded destinations**: For 3-host SSH copies where SSH agent forwarding is active on
+  the destination (`--ssh-forward-agent` or `ForwardAgent` enabled in `~/.ssh/config`), `rcp` never
+  upgrades `ask` to `accept-new`. It authenticates the destination up front under the user's
+  unmodified `StrictHostKeyChecking` policy before any source SSH connection can update
+  `known_hosts` (even across distinct routes sharing an OpenSSH `HostKeyAlias`), and retains that
+  verified master session across destination `~` home expansion (with agent forwarding disabled) and
+  `rcpd` setup so the signing agent is never delegated to an unknown or unverified destination host.
+
+**Residual TOFU limitation**: Under OpenSSH's default `ask` (upgraded to `accept-new`) or an
+explicit `accept-new`, first contact with a host not yet in `known_hosts` trusts the presented SSH
+host key. Because TLS fingerprints and SSH loopback HMAC secrets are distributed over that SSH
+bootstrap session, an active MITM on first contact can impersonate the peer before its key is
+recorded. Environments requiring strict verification on first contact should pre-populate
+`known_hosts` and configure `StrictHostKeyChecking yes` in `~/.ssh/config`.
 
 ### Local Deployment Candidates
 
@@ -245,8 +258,9 @@ shares the same substrate. See [TOCTTOU Vulnerabilities](tocttou.md) for the ful
 
 ### Threats Mitigated
 
-These TLS guarantees assume trustworthy fingerprint distribution; the
-[SSH host-verification limitation](#ssh-host-verification-limitation) still applies.
+These TLS guarantees assume trustworthy fingerprint distribution; see
+[SSH host-key verification](#ssh-host-key-verification) for the first-contact TOFU trust boundary
+and how to enforce `StrictHostKeyChecking yes` via `~/.ssh/config`.
 
 | Threat                    | Mitigation                                           |
 | ------------------------- | ---------------------------------------------------- |
@@ -394,6 +408,8 @@ The security model with `--no-encryption` relies entirely on network isolation.
 ### For Users
 
 1. **Secure Workflows**
+   - Pre-populate `known_hosts` and set `StrictHostKeyChecking yes` in `~/.ssh/config` for
+     environments where first-contact TOFU (`accept-new`) is not acceptable
    - Use SSH agent forwarding carefully (or avoid it)
    - Keep SSH keys protected (passphrase, key agent timeout)
    - Don't use `--no-encryption` unless you understand the implications

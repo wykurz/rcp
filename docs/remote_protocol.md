@@ -139,14 +139,20 @@ promptly. Explicit `ForkAfterAuthentication=no`, `ControlPersist=no`, and `Clear
 command-line overrides prevent user or system SSH configuration from backgrounding it or colliding
 with user-configured port forwards, and `ServerAliveInterval` / `ServerAliveCountMax` (or
 `ServerAliveInterval=0` when `--remote-keepalive-sec=0`) enforce the configured keepalive budget on
-the SSH transport. For 3-host SSH copies where agent forwarding is active or configured
-(`--ssh-forward-agent` or `ForwardAgent` in `~/.ssh/config`), the master authenticates the
-destination's foreground `ssh -M -N` session up front under the user's configured
-`StrictHostKeyChecking` policy (omitting `StrictHostKeyChecking=no`) **before** any source SSH
-connection can update `known_hosts` (including across distinct routes that share an OpenSSH
-`HostKeyAlias` or when a source alias permits `accept-new`), and retains that single verified master
-across optional destination `~` HOME expansion (over the native mux with agent forwarding off) and
-destination `rcpd` setup. The destination daemon is then spawned through
+the SSH transport. `rcp` never passes `StrictHostKeyChecking=no`: for non-agent-forwarded SSH
+sessions (including extra parallel tunnels and 3-host destination → source tunnels), it inspects
+`ssh -G` and upgrades OpenSSH's interactive `ask` default to TOFU
+`-o StrictHostKeyChecking=accept-new` (so first contact works under `BatchMode=yes` while changed
+host keys fail closed), omitting `-o StrictHostKeyChecking=...` whenever `~/.ssh/config` sets an
+explicit policy (`yes`, `accept-new`, `no`) or `ssh -G` cannot be resolved. For 3-host SSH copies
+where agent forwarding is active or configured (`--ssh-forward-agent` or `ForwardAgent` in
+`~/.ssh/config`), the master never upgrades `ask` to `accept-new` and authenticates the
+destination's foreground `ssh -M -N` session up front under the user's unmodified
+`StrictHostKeyChecking` policy **before** any source SSH connection can update `known_hosts`
+(including across distinct routes that share an OpenSSH `HostKeyAlias` or when a source alias
+permits `accept-new`), retaining that single verified master across optional destination `~` HOME
+expansion (over the native mux with agent forwarding off) and destination `rcpd` setup. The
+destination daemon is then spawned through
 `ssh -E <private_exec_log> -S <control_path> -T -o ForkAfterAuthentication=no` so OpenSSH propagates
 `SSH_AUTH_SOCK` into the multiplexed session without polluting `RCP_READY` on stderr with local
 OpenSSH diagnostics (the private log tail is read with a bounded wait on a disposable filesystem

@@ -108,7 +108,7 @@ def copy_argv():
 
 
 def ssh_wrapper():
-    """Current rcp adds StrictHostKeyChecking=no; prepend the harness constraint."""
+    """Enforce strict known-host checking and loopback harness routing on every ssh call."""
     return ("#!/bin/sh\nexec /usr/bin/ssh -F " + GUEST +
         "/ssh_config -o StrictHostKeyChecking=yes -o UserKnownHostsFile=" + GUEST +
         "/home/known_hosts -o GlobalKnownHostsFile=/dev/null "
