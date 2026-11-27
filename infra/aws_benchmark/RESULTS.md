@@ -416,6 +416,11 @@ Starting the machine and preparing its storage come before the harness and are n
 that marked no phase has no such section, and one with a step that recorded none says that it took
 longer than its total. No record or diagnostics format changes.
 
+A table of figures keeps its identifiers whole: the name of a file set, a scenario or a commit is
+never broken to make a table fit, and the name of a suite breaks only between its parts. A table
+wider than the text takes the margin that the page leaves on the right, and scrolls sideways only
+when that is not enough.
+
 The raw evidence behind any run page is retained for 90 days and can be fetched and verified with
 `just aws-benchmark-evidence`; see
 [Find the evidence of a run](PRODUCTION.md#find-the-evidence-of-a-run).

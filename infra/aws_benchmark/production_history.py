@@ -679,7 +679,8 @@ def _file_set(case, points, scenario):
             str(item["duration"]["samples"]) + "</td>" + "".join("<td>" + escape(v) + "</td>" for v in values) +
             "<td>" + ("unavailable (legacy record)" if item["collected_at"] is None else
                       time_html(item["collected_at"])) + "</td><td>" +
-            ", ".join("<code>" + escape(copy.get("cell", copy["variant"])) + "</code> <code>" +
+            # one to a line: side by side they would make the widest column, as no identifier is broken to fit
+            "<br>".join("<code>" + escape(copy.get("cell", copy["variant"])) + "</code> <code>" +
                       escape(copy["series_id"][:12]) +
                       "</code>" for copy in item["copies"]) +
             "</td><td>" + ("not recorded" if item["setup_id"] is None else

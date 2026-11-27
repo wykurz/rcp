@@ -108,6 +108,25 @@
 .aws table.data td { white-space: nowrap; }
 .aws table.data td.reason { min-width: 24ch; white-space: normal; }
 .aws table.cells th { white-space: nowrap; }
+/* the shared stylesheet lets an identifier in a table break, and anywhere: a table that is too wide would squeeze
+   the column of its file sets until their names stood two letters to a line */
+.aws table.data code { white-space: nowrap; }
+/* the name of a suite is long. It breaks between its parts, where its cell says it may, and never inside one */
+.aws table.data td.suite { white-space: normal; }
+.aws table.data td.suite code { white-space: normal; overflow-wrap: normal; }
+/* a table that cannot be as narrow as the text takes the margin that the page leaves on the right before it scrolls
+   sideways. Its box is as wide as the text, or as wide as the table is with every heading wrapped, whichever is
+   more. The page says how wide it is, and a box may be as wide as what the navigation leaves of that; a table
+   inside a block inside a block starts further right and ends where the others do */
+.page-layout { container-type: inline-size; }
+.aws .table-scroll { width: min-content; min-width: 100%; max-width: calc(100cqw - var(--navigation-width) - var(--navigation-gap)); }
+.aws details details .table-scroll { max-width: calc(100cqw - var(--navigation-width) - var(--navigation-gap) - 1rem); }
+@media (max-width: 960px) {
+  /* the navigation stands on top, and the content is as wide as the page */
+  .aws .table-scroll, .aws details details .table-scroll { max-width: 100%; }
+}
+/* the tables of ten columns and more have narrower cells, so that they fit beside the navigation */
+.aws table.dense th, .aws table.dense td { padding-inline: .55rem; }
 /* where a run's time went: lengths of time and shares read from the right, and the bar of each kind of work starts
    at the same edge as its neighbours', level with its row's text */
 .aws th.number, .aws td.number { text-align: right; }

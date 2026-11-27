@@ -413,7 +413,9 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
             aws_link('Resource diagnostics', '#resource-diagnostics', nested=True),
             aws_link('Observed setup', '#observed-setup', nested=True), aws_link('Raw data', '#raw-data', nested=True)])
         rows.append('<tr><td><a href="runs/' + run_key + '.html">' + html.escape(identity['run']) + '</a></td><td>' +
-                    production_export.badge(value) + '</td><td><code>' + html.escape(identity['suite']) +
+                    # the name of a suite may wrap after each of its parts, and nowhere else
+                    production_export.badge(value) + '</td><td class="suite"><code>' +
+                    html.escape(identity['suite']).replace('+', '+<wbr>') +
                     '</code></td><td>' + production_export.commit_html(identity, identity['candidate']) +
                     '</td><td>' + ('<a href="runs/' + run_key + '.html#time-use">' +
                                    production_history.span(use['total']) + '</a>' if use else '—') +

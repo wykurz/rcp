@@ -1193,8 +1193,8 @@ def system_html(value):
         "<p>CPU busy excludes idle and I/O-wait ticks. Device sector counters use 512-byte sectors. "
         "Indexes are zero-based in recorded case/trial order. Ten-second sampling can miss short phases and boundary activity. Sampled cgroup-current maxima are not exact peaks, and any cgroup lifetime peak may include "
         "earlier phases. “Observed” means a phase ended, not that the benchmark phase succeeded.</p>"
-        "<div class='table-scroll'><table class='data'><thead><tr><th>Phase</th><th>Case index</th><th>Trial index</th>"
-        "<th>Observation</th><th>Elapsed s</th><th>Cgroup CPU</th><th>Sampled cgroup memory max</th>"
+        "<div class='table-scroll'><table class='data dense'><thead><tr><th>Phase</th><th>Case index</th>"
+        "<th>Trial index</th><th>Observation</th><th>Elapsed s</th><th>Cgroup CPU</th><th>Sampled cgroup memory max</th>"
         "<th>Host memory available min</th><th>Host CPU busy</th><th>Source logical reads</th>"
         "<th>Destination logical writes</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
 
@@ -1291,7 +1291,7 @@ def _nfs_rpc_html(trials):
             "includes every procedure. A procedure can send several NFSv4 operations in one compound request. "
             "Cumulative round-trip time sums RPC durations, including overlapping requests. RPCs per hard link "
             "divides completed RPCs by the hard links reported by a successful rlink run.</p>"
-            "<div class='table-scroll'><table class='data'><thead><tr><th>File set</th><th>Run</th>"
+            "<div class='table-scroll'><table class='data dense'><thead><tr><th>File set</th><th>Run</th>"
             "<th>Hard links created</th><th>Procedure</th><th>Completed RPCs</th><th>Transmissions</th>"
             "<th>Retransmissions</th><th>Cumulative RTT (ms)</th><th>Mean RTT (ms/RPC)</th>"
             "<th>RPCs per hard link</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
@@ -1332,7 +1332,7 @@ def render(value, record):
                         escape(trial["scenario"] if matrix else trial["variant_id"]) + "</code></td>" +
                         "".join("<td>" + escape(item) + "</td>" for item in fields) + "</tr>")
     if rows:
-        text += ("<div class='table-scroll'><table class='data'><thead><tr>" +
+        text += ("<div class='table-scroll'><table class='data dense'><thead><tr>" +
             ("<th>File set</th><th>Scenario</th><th>" + ("Copy or run" if tools else "Copy") + "</th>" +
              ("<th>Process</th>" if with_roles else "")
              if matrix else "<th>Case</th><th>Variant</th><th>Repeat</th>") +
