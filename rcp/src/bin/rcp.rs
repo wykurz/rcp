@@ -1173,21 +1173,128 @@ fn decode_destination_event(
         .ok_or_else(|| anyhow!(closed_quietly))
 }
 
-fn format_single_role_failure(role: &str, result: remote::protocol::RcpdResult) -> anyhow::Error {
-    let remote::protocol::RcpdResult::Failure { error, summary, .. } = result else {
-        unreachable!("format_single_role_failure called on non-Failure RcpdResult");
-    };
-    // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
-    tracing::error!("{role} rcpd failed: {error}");
-    common::copy::Error::new(
-        anyhow!("rcpd operation(s) failed: {role}: {error}"),
-        summary,
-    )
-    .into()
+/// How the master's wait for one `rcpd` ended.
+///
+/// One failure reaches the master as several events: the result of the daemon that failed, or the
+/// end of its control channel if it died, and the result of the peer that noticed. Which of them
+/// arrives first is not something either daemon controls, so nothing is decided from the first one
+/// alone: each daemon's side is waited out into one of these, and [`settle_daemon_ends`] reads the
+/// pair.
+enum DaemonEnd {
+    /// The daemon reported its result.
+    Reported(Box<remote::protocol::RcpdResult>),
+    /// Its control channel ended, cleanly or with a transport error, before a result arrived. Holds
+    /// the [`rcpd_closed_quietly`] or [`rcpd_went_quiet`] diagnostic.
+    Lost(anyhow::Error),
+    /// The master stopped waiting: after how the peer ended, this daemon's result was not coming in
+    /// time, or not at all.
+    Abandoned,
 }
 
+impl From<anyhow::Result<remote::protocol::RcpdResult>> for DaemonEnd {
+    fn from(decoded: anyhow::Result<remote::protocol::RcpdResult>) -> Self {
+        match decoded {
+            Ok(result) => Self::Reported(Box::new(result)),
+            Err(diagnostic) => Self::Lost(diagnostic),
+        }
+    }
+}
+
+impl DaemonEnd {
+    /// The result the daemon reported, if it reported one.
+    fn reported(&self) -> Option<&remote::protocol::RcpdResult> {
+        match self {
+            Self::Reported(result) => Some(result),
+            Self::Lost(_) | Self::Abandoned => None,
+        }
+    }
+
+    /// How long the peer gets to end as well once this daemon has, `None` for as long as it takes.
+    fn peer_wait(&self, grace: std::time::Duration) -> Option<std::time::Duration> {
+        match self.reported() {
+            // the peer holds the other half of the counts and, on an established copy, sees this
+            // daemon's failure on its own connections: finalizing partial files and reporting may
+            // take it longer than the grace (bounded by SSH keepalive)
+            Some(
+                remote::protocol::RcpdResult::Success { .. }
+                | remote::protocol::RcpdResult::Failure {
+                    peer_connected: true,
+                    ..
+                },
+            ) => None,
+            // failed before the daemons met, or gone without a word: the peer may be waiting for a
+            // connection that never comes, so it gets the time to say what it saw and no more
+            Some(remote::protocol::RcpdResult::Failure {
+                peer_connected: false,
+                ..
+            })
+            | None => Some(grace),
+        }
+    }
+}
+
+/// Decide a remote copy's outcome from how its two daemons ended.
+///
+/// A function of the pair alone: which daemon the master heard from first is not an input. With
+/// both results the outcome is the caller's to merge. Short of that the copy failed, and the error
+/// lists what is known of each daemon, source first: the failure it reported, or the diagnostic of
+/// a control channel that ended without a result. A daemon that reported success, or that was not
+/// waited for, adds nothing.
+fn settle_daemon_ends(
+    source: DaemonEnd,
+    dest: DaemonEnd,
+) -> anyhow::Result<(remote::protocol::RcpdResult, remote::protocol::RcpdResult)> {
+    let (source, dest) = match (source, dest) {
+        (DaemonEnd::Reported(source), DaemonEnd::Reported(dest)) => return Ok((*source, *dest)),
+        ends => ends,
+    };
+    let mut findings = Vec::with_capacity(2);
+    let mut lost = Vec::with_capacity(2);
+    // at most one daemon reported from here on, so at most one summary is known
+    let mut failed_summary = None;
+    for (role, end) in [("Source", source), ("Destination", dest)] {
+        match end {
+            DaemonEnd::Reported(result) => {
+                if let remote::protocol::RcpdResult::Failure { error, summary, .. } = *result {
+                    // rcp-error-log-allow: RcpdResult::Failure.error is a String off the wire, not a chain
+                    tracing::error!("{role} rcpd failed: {error}");
+                    findings.push(format!("{role}: {error}"));
+                    failed_summary = Some(summary);
+                }
+            }
+            DaemonEnd::Lost(diagnostic) => {
+                findings.push(format!("{diagnostic:#}"));
+                lost.push(diagnostic);
+            }
+            DaemonEnd::Abandoned => {}
+        }
+    }
+    // a lost daemon with nothing beside it keeps its diagnostic as it is, chain included
+    if findings.len() == 1
+        && let Some(diagnostic) = lost.pop()
+    {
+        return Err(diagnostic);
+    }
+    // two findings stand side by side: a chain would make one the cause of the other, and which
+    // of them is the cause is not known here
+    let findings = findings.join("; ");
+    Err(match failed_summary {
+        Some(summary) => {
+            common::copy::Error::new(anyhow!("rcpd operation(s) failed: {findings}"), summary)
+                .into()
+        }
+        // not reached from the waits in this file: a daemon is abandoned only after its peer
+        // failed or was lost
+        None if findings.is_empty() => {
+            anyhow!("remote copy ended without a result from both rcpd processes")
+        }
+        None => anyhow!("{findings}"),
+    })
+}
+
+/// Wait out the source once the destination has ended, and settle.
 async fn finish_after_dest_terminal<W, SourceFut>(
-    dest_result_or_error: anyhow::Result<remote::protocol::RcpdResult>,
+    dest: DaemonEnd,
     source_fut: std::pin::Pin<&mut SourceFut>,
     source_stdin: &mut Option<remote::stdio::MasterStdinSender<W>>,
     source_host: &str,
@@ -1197,74 +1304,63 @@ where
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     SourceFut: std::future::Future<Output = anyhow::Result<Option<remote::protocol::RcpdResult>>>,
 {
-    match dest_result_or_error {
-        Ok(dest_result @ remote::protocol::RcpdResult::Success { .. }) => {
-            let source_result = decode_daemon_result(source_fut.await, "source", source_host)?;
-            Ok((source_result, dest_result))
-        }
-        Ok(
-            dest_result @ remote::protocol::RcpdResult::Failure {
-                peer_connected: true,
-                ..
-            },
-        ) => {
-            // destination failed on an established copy: source observes TCP close and owns skip
-            // counts, so let it deliver its terminal result (bounded by SSH keepalive) rather than
-            // cutting it off after the pre-connection grace timer
-            match decode_daemon_result(source_fut.await, "source", source_host) {
-                Ok(source_result) => Ok((source_result, dest_result)),
-                Err(source_err) => {
-                    tracing::debug!(
-                        "source on '{source_host}' did not report a result after destination failure: {source_err:#}"
-                    );
-                    if let Some(stdin) = source_stdin.take() {
-                        stdin.close().await;
-                    }
-                    Err(format_single_role_failure("Destination", dest_result))
-                }
+    let source = match dest.peer_wait(peer_failure_grace) {
+        None => DaemonEnd::from(decode_daemon_result(
+            source_fut.await,
+            "source",
+            source_host,
+        )),
+        Some(grace) => match tokio::time::timeout(grace, source_fut).await {
+            Ok(result) => DaemonEnd::from(decode_daemon_result(result, "source", source_host)),
+            Err(_) => DaemonEnd::Abandoned,
+        },
+    };
+    // a source that has not reported is not waited for any longer
+    if !matches!(source, DaemonEnd::Reported(_))
+        && let Some(stdin) = source_stdin.take()
+    {
+        stdin.close().await;
+    }
+    settle_daemon_ends(source, dest)
+}
+
+/// Wait out the destination once the source has ended.
+async fn dest_end_after_source(
+    source: &DaemonEnd,
+    dest_control_rx: &mut remote::stdio::MasterControlReceiver,
+    dest_host: &str,
+    peer_failure_grace: std::time::Duration,
+) -> DaemonEnd {
+    let event = match source.peer_wait(peer_failure_grace) {
+        None => dest_control_rx.recv_destination_event().await,
+        Some(grace) => {
+            match tokio::time::timeout(grace, dest_control_rx.recv_destination_event()).await {
+                Ok(event) => event,
+                Err(_) => return DaemonEnd::Abandoned,
             }
         }
-        Ok(
-            dest_result @ remote::protocol::RcpdResult::Failure {
-                peer_connected: false,
-                ..
-            },
-        ) => {
-            // destination failed before connecting: give source a short grace in case it already
-            // failed independently, without stalling for the full accept timeout
-            match tokio::time::timeout(peer_failure_grace, source_fut).await {
-                Ok(src_res) => match decode_daemon_result(src_res, "source", source_host) {
-                    Ok(source_result) => Ok((source_result, dest_result)),
-                    Err(source_err) => {
-                        tracing::debug!(
-                            "source on '{source_host}' did not report a result after destination failure: {source_err:#}"
-                        );
-                        if let Some(stdin) = source_stdin.take() {
-                            stdin.close().await;
-                        }
-                        Err(format_single_role_failure("Destination", dest_result))
-                    }
-                },
-                Err(_) => {
-                    if let Some(stdin) = source_stdin.take() {
-                        stdin.close().await;
-                    }
-                    Err(format_single_role_failure("Destination", dest_result))
-                }
+    };
+    match decode_destination_event(event, dest_host) {
+        Ok(remote::stdio::DestinationControlEvent::Result(dest_result)) => {
+            DaemonEnd::Reported(dest_result)
+        }
+        Ok(remote::stdio::DestinationControlEvent::DirectConnectFailed { reason }) => {
+            if matches!(
+                source.reported(),
+                Some(remote::protocol::RcpdResult::Success { .. })
+            ) {
+                DaemonEnd::Lost(anyhow!(
+                    "destination rcpd on '{dest_host}' reported DirectConnectFailed ({reason}) after source already succeeded"
+                ))
+            } else {
+                // still looking for a way to a source that has ended: it has nothing to report
+                tracing::debug!(
+                    "destination on '{dest_host}' reported DirectConnectFailed ({reason}) after source ended; closing destination stdin"
+                );
+                DaemonEnd::Abandoned
             }
         }
-        Err(dest_error) => {
-            // destination died without reporting a result: give an already-connected source a
-            // short grace to observe TCP close and log its attribution before closing source stdin
-            if tokio::time::timeout(peer_failure_grace, source_fut)
-                .await
-                .is_err()
-                && let Some(stdin) = source_stdin.take()
-            {
-                stdin.close().await;
-            }
-            Err(dest_error)
-        }
+        Err(diagnostic) => DaemonEnd::Lost(diagnostic),
     }
 }
 
@@ -1295,71 +1391,18 @@ where
             // if source has already failed
             biased;
             src_res = &mut source_fut => {
-                let source_result = decode_daemon_result(src_res, "source", source_host)?;
-                if let remote::protocol::RcpdResult::Failure { peer_connected, .. } = &source_result
+                let source =
+                    DaemonEnd::from(decode_daemon_result(src_res, "source", source_host));
+                let dest =
+                    dest_end_after_source(&source, dest_control_rx, dest_host, peer_failure_grace)
+                        .await;
+                // a destination that has not reported is not waited for any longer
+                if !matches!(dest, DaemonEnd::Reported(_))
+                    && let Some(stdin) = dest_stdin.take()
                 {
-                    let peer_connected = *peer_connected;
-                    let dest_event = if peer_connected {
-                        // source failed on an established copy: destination owns the copied file
-                        // and byte counts and may need more than `peer_failure_grace` to flush and
-                        // finalize partial writes before sending its terminal RcpdResult
-                        Ok(dest_control_rx.recv_destination_event().await)
-                    } else {
-                        // source failed before destination connected: keep prompt cancellation so
-                        // a destination probing direct TCP or setting up fallback does not stall
-                        tokio::time::timeout(
-                            peer_failure_grace,
-                            dest_control_rx.recv_destination_event(),
-                        )
-                        .await
-                    };
-                    match dest_event {
-                        Ok(Ok(Some(remote::stdio::DestinationControlEvent::Result(
-                            dest_result,
-                        )))) => {
-                            return Ok((source_result, *dest_result));
-                        }
-                        Ok(Ok(Some(
-                            remote::stdio::DestinationControlEvent::DirectConnectFailed { reason },
-                        ))) => {
-                            tracing::debug!(
-                                "destination on '{dest_host}' reported DirectConnectFailed ({reason}) after source failed; closing destination stdin"
-                            );
-                            if let Some(stdin) = dest_stdin.take() {
-                                stdin.close().await;
-                            }
-                            return Err(format_single_role_failure("Source", source_result));
-                        }
-                        Ok(Ok(None)) | Err(_) => {
-                            if let Some(stdin) = dest_stdin.take() {
-                                stdin.close().await;
-                            }
-                            return Err(format_single_role_failure("Source", source_result));
-                        }
-                        Ok(Err(dest_err)) => {
-                            tracing::debug!(
-                                "destination on '{dest_host}' control channel failed after source failure: {dest_err:#}"
-                            );
-                            if let Some(stdin) = dest_stdin.take() {
-                                stdin.close().await;
-                            }
-                            return Err(format_single_role_failure("Source", source_result));
-                        }
-                    }
+                    stdin.close().await;
                 }
-                match decode_destination_event(dest_control_rx.recv_destination_event().await, dest_host)? {
-                    remote::stdio::DestinationControlEvent::Result(dest_result) => {
-                        return Ok((source_result, *dest_result));
-                    }
-                    remote::stdio::DestinationControlEvent::DirectConnectFailed { reason } => {
-                        if let Some(stdin) = dest_stdin.take() {
-                            stdin.close().await;
-                        }
-                        anyhow::bail!(
-                            "destination rcpd on '{dest_host}' reported DirectConnectFailed ({reason}) after source already succeeded"
-                        );
-                    }
-                }
+                return settle_daemon_ends(source, dest);
             }
             dst_event = dest_control_rx.recv_destination_event() => {
                 match decode_destination_event(dst_event, dest_host) {
@@ -1392,37 +1435,42 @@ where
                         };
                         let (control_addr, data_addrs) = match selected {
                             FallbackSelect::SourceFinished(src_res) => {
+                                // the destination waits for the tunnels this would have opened:
+                                // nothing more comes from it
                                 if let Some(stdin) = dest_stdin.take() {
                                     stdin.close().await;
                                 }
-                                let source_result =
-                                    decode_daemon_result(src_res, "source", source_host)?;
+                                let source = DaemonEnd::from(decode_daemon_result(
+                                    src_res,
+                                    "source",
+                                    source_host,
+                                ));
                                 if matches!(
-                                    source_result,
-                                    remote::protocol::RcpdResult::Failure { .. }
+                                    source.reported(),
+                                    Some(remote::protocol::RcpdResult::Success { .. })
                                 ) {
-                                    return Err(format_single_role_failure("Source", source_result));
+                                    anyhow::bail!(
+                                        "source rcpd on '{source_host}' completed while destination on '{dest_host}' had not connected ({reason})"
+                                    );
                                 }
-                                anyhow::bail!(
-                                    "source rcpd on '{source_host}' completed while destination on '{dest_host}' had not connected ({reason})"
-                                );
+                                return settle_daemon_ends(source, DaemonEnd::Abandoned);
                             }
                             FallbackSelect::DestEvent(dst_event) => {
-                                let terminal = match decode_destination_event(dst_event, dest_host) {
+                                let dest = match decode_destination_event(dst_event, dest_host) {
                                     Ok(remote::stdio::DestinationControlEvent::Result(res)) => {
-                                        Ok(*res)
+                                        DaemonEnd::Reported(res)
                                     }
                                     Ok(
                                         remote::stdio::DestinationControlEvent::DirectConnectFailed {
                                             reason: duplicate,
                                         },
-                                    ) => Err(anyhow!(
+                                    ) => DaemonEnd::Lost(anyhow!(
                                         "destination rcpd on '{dest_host}' sent duplicate DirectConnectFailed: {duplicate}"
                                     )),
-                                    Err(dest_err) => Err(dest_err),
+                                    Err(diagnostic) => DaemonEnd::Lost(diagnostic),
                                 };
                                 return finish_after_dest_terminal(
-                                    terminal,
+                                    dest,
                                     source_fut.as_mut(),
                                     source_stdin,
                                     source_host,
@@ -1441,7 +1489,7 @@ where
                     }
                     Ok(remote::stdio::DestinationControlEvent::Result(dest_result)) => {
                         return finish_after_dest_terminal(
-                            Ok(*dest_result),
+                            DaemonEnd::Reported(dest_result),
                             source_fut.as_mut(),
                             source_stdin,
                             source_host,
@@ -1449,9 +1497,9 @@ where
                         )
                         .await;
                     }
-                    Err(dest_error) => {
+                    Err(diagnostic) => {
                         return finish_after_dest_terminal(
-                            Err(dest_error),
+                            DaemonEnd::Lost(diagnostic),
                             source_fut.as_mut(),
                             source_stdin,
                             source_host,
@@ -4067,5 +4115,290 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The master's ends of one daemon whose stdout the test writes itself.
+    struct ScriptedDaemon {
+        stdout: tokio::io::DuplexStream,
+        control_rx: remote::stdio::MasterControlReceiver,
+        // aborted when dropped: the daemon's stdout is read for as long as this lives
+        _demux: remote::AbortOnDropTask<()>,
+        stdin: Option<remote::stdio::MasterStdinSender<tokio::io::DuplexStream>>,
+        stdin_reader: remote::streams::RecvStream<tokio::io::DuplexStream>,
+    }
+
+    fn scripted_daemon(rcpd_type: remote::tracelog::RcpdType) -> ScriptedDaemon {
+        let (stdout, master_reader) = tokio::io::duplex(4096);
+        let (control_rx, demux) = remote::stdio::spawn_master_stdout_demux(
+            remote::streams::RecvStream::new(master_reader),
+            rcpd_type,
+        );
+        let (stdin_writer, stdin_reader) = tokio::io::duplex(4096);
+        ScriptedDaemon {
+            stdout,
+            control_rx,
+            _demux: demux,
+            stdin: Some(remote::stdio::MasterStdinSender::new(stdin_writer, 0)),
+            stdin_reader: remote::streams::RecvStream::new(stdin_reader),
+        }
+    }
+
+    /// How a scripted daemon's control channel ends.
+    #[derive(Clone, Copy, Debug)]
+    enum Ending {
+        /// The daemon reports this failure on an established copy and exits.
+        Fails(&'static str),
+        /// Its stdout closes cleanly with no result, as when the process is killed.
+        ClosesQuietly,
+        /// Its stdout ends inside a frame, as when the SSH channel is cut.
+        BreaksOff,
+    }
+
+    impl Ending {
+        /// Play the ending on a daemon's stdout, which closes with it.
+        async fn play(self, mut stdout: tokio::io::DuplexStream, files_skipped: usize) {
+            use tokio::io::AsyncWriteExt as _;
+            match self {
+                Self::Fails(error) => {
+                    let result = remote::protocol::RcpdResult::Failure {
+                        error: error.to_owned(),
+                        summary: common::copy::Summary {
+                            files_skipped,
+                            ..Default::default()
+                        },
+                        runtime_stats: Default::default(),
+                        peer_connected: true,
+                    };
+                    remote::streams::SendStream::new(&mut stdout)
+                        .send_control_message(&remote::protocol::RcpdToMaster::Result(result))
+                        .await
+                        .unwrap();
+                }
+                Self::ClosesQuietly => {}
+                // a length prefix that promises more than follows
+                Self::BreaksOff => stdout.write_all(&[0, 0, 0, 16, 1]).await.unwrap(),
+            }
+        }
+
+        /// What the master's report says of a daemon that ended this way.
+        fn reported_as(self, role: &str, title: &str, host: &str) -> String {
+            match self {
+                Self::Fails(error) => format!("{title}: {error}"),
+                Self::ClosesQuietly => rcpd_closed_quietly(role, host, "report a result"),
+                Self::BreaksOff => rcpd_went_quiet(role, host, "report a result"),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Role {
+        Source,
+        Destination,
+    }
+
+    /// The text of a report, once: an error that carries a summary shows its chain in its own
+    /// `Display` and again as its source.
+    fn report_text(error: &anyhow::Error) -> String {
+        match error.downcast_ref::<common::copy::Error>() {
+            Some(with_summary) => format!("{:#}", with_summary.source),
+            None => format!("{error:#}"),
+        }
+    }
+
+    const SOURCE_FILES_SKIPPED: usize = 2;
+    const DEST_FILES_SKIPPED: usize = 4;
+
+    /// The master's report for a pair of endings, when `first`'s ending is there as the master
+    /// starts to look and the other daemon's arrives while it waits. For a paused clock, which
+    /// makes "while it waits" exact.
+    async fn report_when_first(first: Role, source: Ending, dest: Ending) -> anyhow::Error {
+        let mut source_daemon = scripted_daemon(remote::tracelog::RcpdType::Source);
+        let mut dest_daemon = scripted_daemon(remote::tracelog::RcpdType::Destination);
+        let play_source = source.play(source_daemon.stdout, SOURCE_FILES_SKIPPED);
+        let play_dest = dest.play(dest_daemon.stdout, DEST_FILES_SKIPPED);
+        let late = std::time::Duration::from_millis(50);
+        let late_ending = match first {
+            Role::Source => {
+                play_source.await;
+                tokio::spawn(async move {
+                    tokio::time::sleep(late).await;
+                    play_dest.await;
+                })
+            }
+            Role::Destination => {
+                play_dest.await;
+                tokio::spawn(async move {
+                    tokio::time::sleep(late).await;
+                    play_source.await;
+                })
+            }
+        };
+        let opener: Option<TestFallbackOpener> = None;
+        // a grace far beyond the late ending, so that it is never what ends a wait here
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            await_daemon_results_with_fallback(
+                &mut source_daemon.control_rx,
+                &mut dest_daemon.control_rx,
+                &mut source_daemon.stdin,
+                &mut dest_daemon.stdin,
+                opener,
+                "src-host",
+                "dst-host",
+                std::time::Duration::from_secs(20),
+            ),
+        )
+        .await
+        .expect("the master must settle once both daemons have ended");
+        late_ending.await.unwrap();
+        result.expect_err("a daemon that ended without a result fails the copy")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_daemon_results_report_is_the_same_whichever_daemon_ends_first() {
+        let source_failure = Ending::Fails("destination closed control before DestinationDone");
+        let dest_failure = Ending::Fails("data stream closed before the transfer completed");
+        for (source, dest) in [
+            (source_failure, Ending::ClosesQuietly),
+            (source_failure, Ending::BreaksOff),
+            (Ending::ClosesQuietly, dest_failure),
+            (Ending::BreaksOff, dest_failure),
+            (Ending::ClosesQuietly, Ending::ClosesQuietly),
+            (Ending::BreaksOff, Ending::ClosesQuietly),
+        ] {
+            let source_first = report_when_first(Role::Source, source, dest).await;
+            let dest_first = report_when_first(Role::Destination, source, dest).await;
+            let report = report_text(&source_first);
+            assert_eq!(
+                report,
+                report_text(&dest_first),
+                "source {source:?}, destination {dest:?}: the report depends on which daemon ended first"
+            );
+            for (ending, role, title, host) in [
+                (source, "source", "Source", "src-host"),
+                (dest, "destination", "Destination", "dst-host"),
+            ] {
+                let expected = ending.reported_as(role, title, host);
+                assert!(
+                    report.contains(&expected),
+                    "source {source:?}, destination {dest:?}: no {expected:?} in {report:?}"
+                );
+            }
+            // the counts of the one daemon that reported are kept in either order
+            let expected_counts = match (source, dest) {
+                (Ending::Fails(_), _) => Some(SOURCE_FILES_SKIPPED),
+                (_, Ending::Fails(_)) => Some(DEST_FILES_SKIPPED),
+                _ => None,
+            };
+            for error in [&source_first, &dest_first] {
+                let counts = error
+                    .downcast_ref::<common::copy::Error>()
+                    .map(|error| error.summary.files_skipped);
+                assert_eq!(
+                    counts, expected_counts,
+                    "source {source:?}, destination {dest:?}: {error:#}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_daemon_results_lists_what_is_known_of_each_daemon_source_first() {
+        let lost = "(the process likely died - check the remote host for crashes or OOM kills)";
+        let killed_destination = report_when_first(
+            Role::Source,
+            Ending::Fails("destination closed control before DestinationDone"),
+            Ending::ClosesQuietly,
+        )
+        .await;
+        assert_eq!(
+            report_text(&killed_destination),
+            format!(
+                "rcpd operation(s) failed: Source: destination closed control before \
+                 DestinationDone; destination rcpd on 'dst-host' closed its control connection \
+                 cleanly but did not report a result {lost}"
+            )
+        );
+        let killed_source = report_when_first(
+            Role::Destination,
+            Ending::ClosesQuietly,
+            Ending::Fails("data stream closed before the transfer completed"),
+        )
+        .await;
+        assert_eq!(
+            report_text(&killed_source),
+            format!(
+                "rcpd operation(s) failed: source rcpd on 'src-host' closed its control \
+                 connection cleanly but did not report a result {lost}; Destination: data stream \
+                 closed before the transfer completed"
+            )
+        );
+        let both_killed =
+            report_when_first(Role::Source, Ending::ClosesQuietly, Ending::ClosesQuietly).await;
+        assert_eq!(
+            report_text(&both_killed),
+            format!(
+                "source rcpd on 'src-host' closed its control connection cleanly but did not \
+                 report a result {lost}; destination rcpd on 'dst-host' closed its control \
+                 connection cleanly but did not report a result {lost}"
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_daemon_results_gives_the_peer_of_a_lost_daemon_the_grace_and_no_more() {
+        use tokio::io::AsyncWriteExt as _;
+        let grace = std::time::Duration::from_millis(100);
+        for lost in [Role::Source, Role::Destination] {
+            let mut source = scripted_daemon(remote::tracelog::RcpdType::Source);
+            let mut dest = scripted_daemon(remote::tracelog::RcpdType::Destination);
+            // one daemon is gone, and its peer stays up and says nothing
+            let (gone, expected) = match lost {
+                Role::Source => (
+                    &mut source,
+                    rcpd_closed_quietly("source", "src-host", "report a result"),
+                ),
+                Role::Destination => (
+                    &mut dest,
+                    rcpd_closed_quietly("destination", "dst-host", "report a result"),
+                ),
+            };
+            gone.stdout.shutdown().await.unwrap();
+            let opener: Option<TestFallbackOpener> = None;
+            let started = tokio::time::Instant::now();
+            let error = await_daemon_results_with_fallback(
+                &mut source.control_rx,
+                &mut dest.control_rx,
+                &mut source.stdin,
+                &mut dest.stdin,
+                opener,
+                "src-host",
+                "dst-host",
+                grace,
+            )
+            .await
+            .expect_err("a daemon that ended without a result fails the copy");
+            assert_eq!(
+                started.elapsed(),
+                grace,
+                "{lost:?} lost: its peer gets the grace to report, and no more"
+            );
+            assert_eq!(report_text(&error), expected, "{lost:?} lost");
+            // the peer that was not heard from is told to stop
+            let silent = match lost {
+                Role::Source => &mut dest,
+                Role::Destination => &mut source,
+            };
+            assert!(silent.stdin.is_none(), "{lost:?} lost");
+            assert!(
+                silent
+                    .stdin_reader
+                    .recv_object::<remote::protocol::MasterToRcpd>()
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{lost:?} lost"
+            );
+        }
     }
 }
