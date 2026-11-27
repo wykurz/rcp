@@ -125,9 +125,9 @@ class ToolTrendTests(unittest.TestCase):
         self.assertIn("<th>Tool runs</th>", html)
         self.assertIn(" · 6 tool runs", html)
         self.assertNotIn("copies", html.split("<details>")[0])
-        # the table names the cells whose runs a point holds
+        # the table names the cells whose runs a point holds, one to a line
         self.assertIn("<code>local-rrm</code> <code>", html)
-        self.assertIn(", <code>remote-rrm</code> <code>", html)
+        self.assertIn("<br><code>remote-rrm</code> <code>", html)
         compare = history.render(records, companions, "rcmp")
         self.assertEqual(titles(compare), MANY_FILES)
         self.assertIn("1,024,000 files of 1 MB each (1.024 TB), compared with their source by rcmp, by file size, "

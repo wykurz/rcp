@@ -1086,6 +1086,19 @@ class ReportSiteTests(unittest.TestCase):
                       '</td><td><time ', index)
         self.assertIn('</code></a></td><td>—</td><td><time ', index)
 
+    def test_the_list_of_runs_breaks_the_name_of_a_suite_between_its_parts_only(self):
+        import report_site
+        from infra.aws_benchmark import production_export
+        from infra.aws_benchmark.test_matrix_pages import matrix_example
+        record, extra = matrix_example('matrix-1g-local+tools+remote')
+        index = report_site.render_aws_benchmarks(
+            {record['run_key']: production_export.collection.encoded(record)},
+            diagnostics={record['run_key']: extra})[Path('aws-benchmarks/index.html')]
+        # the longest suite has eight parts: its cell may wrap after each, and the stylesheet lets it wrap nowhere
+        # else, so that neither the name nor the commit beside it is cut in the middle
+        self.assertIn('<td class="suite"><code>matrix-1g-local+<wbr>tools+<wbr>remote</code></td>', index)
+        self.assertNotIn('<td><code>matrix-', index)
+
     def test_a_site_with_two_generations_of_file_sets_has_no_dangling_link(self):
         from infra.aws_benchmark.production_publish import inventory
         from infra.aws_benchmark.test_matrix_pages import matrix_example
