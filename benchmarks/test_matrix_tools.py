@@ -166,7 +166,7 @@ class ToolCellTests(unittest.TestCase):
                                               "remote-rcmp", "remote-rlink", "remote-rrm",
                                               "nfs-rcmp", "nfs-rlink", "nfs-rrm",
                                               "memory-rcmp", "memory-rlink", "memory-rrm"])
-        self.assertEqual(matrix.SCENARIOS, ("local", "remote", "nfs", "memory", *matrix.TOOLS))
+        self.assertEqual(matrix.SCENARIOS, ("local", "remote", "nfs", "memory", *matrix.TOOLS, *matrix.REFERENCES))
         self.assertEqual([(cell["follows"], cell["tool"]) for cell in matrix.TOOLS.values()],
                          [(copies, tool) for copies in ("local", "remote", "nfs", "memory")
                           for tool in ("rcmp", "rlink", "rrm")])
