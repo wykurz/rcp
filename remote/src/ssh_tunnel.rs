@@ -94,6 +94,23 @@ impl ForwardDirection {
     }
 }
 
+/// Effective `StrictHostKeyChecking` mode reported by `ssh -G`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SshStrictHostKeyChecking {
+    /// `ask` (OpenSSH's interactive default when unset; fails non-interactively under
+    /// `BatchMode=yes`, so `rcp` upgrades non-agent-forwarded sessions to TOFU `accept-new`).
+    Ask,
+    /// `yes` / `true` (strictly require an existing matching `known_hosts` entry).
+    Yes,
+    /// `accept-new` (TOFU: accept unseen host keys, reject changed keys).
+    AcceptNew,
+    /// `no` / `off` / `false` (user explicitly disabled host-key checking in `~/.ssh/config`).
+    No,
+    /// Missing or unrecognized value (fail safe by omitting `-o StrictHostKeyChecking=...`).
+    #[default]
+    Unknown,
+}
+
 /// Effective SSH connection settings resolved locally via `ssh -G`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedSshConfig {
@@ -107,6 +124,8 @@ pub struct ResolvedSshConfig {
     pub forward_agent_enabled: bool,
     /// Effective `AddressFamily` (`any`, `inet`, or `inet6`).
     pub address_family: SshAddressFamily,
+    /// Effective `StrictHostKeyChecking` policy parsed from `ssh -G`.
+    pub strict_host_key_checking: SshStrictHostKeyChecking,
     /// Effective `ProxyJump` (`None` if unset or `none`).
     pub proxy_jump: Option<String>,
     /// Effective `ProxyCommand` (`None` if unset or `none`).
@@ -128,6 +147,21 @@ fn contains_unexpanded_alias_token(value: &str) -> bool {
 }
 
 impl ResolvedSshConfig {
+    /// Select the concrete [`crate::HostKeyPolicy`] for non-agent-forwarded SSH connections:
+    /// upgrade OpenSSH's default `ask` (which cannot prompt under `BatchMode=yes`) to TOFU
+    /// `accept-new`, while leaving explicit `yes`, `accept-new`, `no`, and unknown values
+    /// untouched so `~/.ssh/config` always wins.
+    #[must_use]
+    pub(crate) const fn host_key_policy(&self) -> crate::HostKeyPolicy {
+        match self.strict_host_key_checking {
+            SshStrictHostKeyChecking::Ask => crate::HostKeyPolicy::AcceptNew,
+            SshStrictHostKeyChecking::Yes
+            | SshStrictHostKeyChecking::AcceptNew
+            | SshStrictHostKeyChecking::No
+            | SshStrictHostKeyChecking::Unknown => crate::HostKeyPolicy::HonorConfig,
+        }
+    }
+
     /// Return true when both resolved configs unequivocally target the same SSH endpoint
     /// (`HostName`, `Port`, and proxy routing), justifying the same-host direct-TCP shortcut even
     /// when operand usernames or aliases differ.
@@ -184,6 +218,8 @@ pub(crate) fn parse_ssh_g_output(
     let mut saw_forward_agent = false;
     let mut address_family = SshAddressFamily::Any;
     let mut saw_address_family = false;
+    let mut strict_host_key_checking = SshStrictHostKeyChecking::Unknown;
+    let mut saw_strict_host_key_checking = false;
     let mut proxy_jump: Option<String> = None;
     let mut saw_proxy_jump = false;
     let mut proxy_command: Option<String> = None;
@@ -222,6 +258,24 @@ pub(crate) fn parse_ssh_g_output(
             } else {
                 SshAddressFamily::Any
             };
+        } else if key.eq_ignore_ascii_case("stricthostkeychecking") && !saw_strict_host_key_checking
+        {
+            saw_strict_host_key_checking = true;
+            strict_host_key_checking =
+                if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
+                    SshStrictHostKeyChecking::Yes
+                } else if value.eq_ignore_ascii_case("false")
+                    || value.eq_ignore_ascii_case("no")
+                    || value.eq_ignore_ascii_case("off")
+                {
+                    SshStrictHostKeyChecking::No
+                } else if value.eq_ignore_ascii_case("accept-new") {
+                    SshStrictHostKeyChecking::AcceptNew
+                } else if value.eq_ignore_ascii_case("ask") {
+                    SshStrictHostKeyChecking::Ask
+                } else {
+                    SshStrictHostKeyChecking::Unknown
+                };
         } else if key.eq_ignore_ascii_case("proxyjump") && !saw_proxy_jump {
             saw_proxy_jump = true;
             if !value.is_empty() && !value.eq_ignore_ascii_case("none") {
@@ -245,6 +299,7 @@ pub(crate) fn parse_ssh_g_output(
         target,
         forward_agent_enabled,
         address_family,
+        strict_host_key_checking,
         proxy_jump,
         proxy_command,
     })
@@ -259,11 +314,28 @@ pub async fn resolve_ssh_config(
     timeout: std::time::Duration,
     cleanup: &crate::RemoteCleanup,
 ) -> anyhow::Result<ResolvedSshConfig> {
-    resolve_ssh_config_with_program(session, std::path::Path::new("ssh"), timeout, cleanup).await
+    resolve_ssh_config_with_override(session, None, timeout, cleanup).await
+}
+
+pub(crate) async fn resolve_ssh_config_with_override(
+    session: &crate::SshSession,
+    hostname_override: Option<std::net::IpAddr>,
+    timeout: std::time::Duration,
+    cleanup: &crate::RemoteCleanup,
+) -> anyhow::Result<ResolvedSshConfig> {
+    resolve_ssh_config_with_program(
+        session,
+        hostname_override,
+        std::path::Path::new("ssh"),
+        timeout,
+        cleanup,
+    )
+    .await
 }
 
 async fn resolve_ssh_config_with_program(
     session: &crate::SshSession,
+    hostname_override: Option<std::net::IpAddr>,
     ssh_program: &std::path::Path,
     timeout: std::time::Duration,
     cleanup: &crate::RemoteCleanup,
@@ -276,6 +348,9 @@ async fn resolve_ssh_config_with_program(
         .arg("-G")
         // OpenSSH rejects `ssh -G` when the matched host sets `ForkAfterAuthentication yes`
         .args(["-o", "ForkAfterAuthentication=no"]);
+    if let Some(ip) = hostname_override {
+        cmd.arg("-o").arg(format!("HostName={ip}"));
+    }
     if let Some(port) = session.port {
         cmd.arg("-p").arg(port.to_string());
     }
@@ -797,9 +872,9 @@ impl SshTunnelSet {
     /// advertising any forwarded port, and degrade gracefully down to 1 if `sshd` rate-limits
     /// additional connections or routes them to another load-balanced backend.
     #[allow(clippy::too_many_arguments)]
-    pub async fn open_on_existing_session(
+    pub(crate) async fn open_on_existing_session(
         direction: ForwardDirection,
-        primary_control_path: &std::path::Path,
+        primary: &crate::ManagedSshSession,
         session: &crate::SshSession,
         target_control: std::net::SocketAddr,
         target_data: Option<std::net::SocketAddr>,
@@ -818,9 +893,10 @@ impl SshTunnelSet {
             1
         };
         let deadline = checked_deadline(timeout);
+        let primary_control_path = primary.control_path();
         let (control_addr, primary_data_addr, primary_forwards) =
             open_primary_forwards_with_timeout(
-                primary_control_path,
+                &primary_control_path,
                 direction,
                 target_control,
                 target_data,
@@ -850,30 +926,41 @@ impl SshTunnelSet {
             && requested_tunnels > 1
         {
             if let Some(expected) = expected_peer {
-                let unpinned_opts = crate::SshConnectOptions {
-                    keepalive_sec,
-                    agent_forward: crate::AgentForwardMode::Off,
-                    host_key_policy: crate::HostKeyPolicy::AutoAccept,
-                    hostname_override: None,
-                };
-                let pinned = pinned_session_and_options(session, node_endpoint, keepalive_sec);
-                let extra = open_extra_data_tunnels(
-                    direction,
-                    session,
-                    unpinned_opts,
-                    pinned.as_ref(),
-                    target_data,
-                    extra_address_family,
-                    Some(expected),
-                    requested_tunnels - 1,
-                    deadline,
-                    cleanup,
-                    local_operand_roots,
-                )
-                .await;
-                for (extra_session, addr) in extra {
-                    owned_sessions.push(extra_session);
-                    data_addrs.push(addr);
+                if !remaining_budget(deadline).is_zero() {
+                    let host_key_policy = primary.host_key_policy();
+                    let unpinned_opts = crate::SshConnectOptions {
+                        keepalive_sec,
+                        agent_forward: crate::AgentForwardMode::Off,
+                        host_key_policy,
+                        hostname_override: None,
+                    };
+                    let pinned = resolve_pinned_session_and_options(
+                        session,
+                        node_endpoint,
+                        keepalive_sec,
+                        host_key_policy,
+                        deadline,
+                        cleanup,
+                    )
+                    .await;
+                    let extra = open_extra_data_tunnels(
+                        direction,
+                        session,
+                        unpinned_opts,
+                        pinned.as_ref(),
+                        target_data,
+                        extra_address_family,
+                        Some(expected),
+                        requested_tunnels - 1,
+                        deadline,
+                        cleanup,
+                        local_operand_roots,
+                    )
+                    .await;
+                    for (extra_session, addr) in extra {
+                        owned_sessions.push(extra_session);
+                        data_addrs.push(addr);
+                    }
                 }
             } else {
                 tracing::debug!(
@@ -924,24 +1011,36 @@ impl SshTunnelSet {
             .max(1);
         let deadline = checked_deadline(timeout);
         let base_session = crate::SshSession::from(source_ssh);
-        let address_family = resolve_ssh_config(
-            &base_session,
-            remaining_budget(deadline).min(std::time::Duration::from_secs(5)),
-            cleanup,
-        )
-        .await
-        .map_or(SshAddressFamily::Any, |resolved| resolved.address_family);
+        let config_timeout =
+            (remaining_budget(deadline) / 2).min(std::time::Duration::from_secs(5));
+        let (address_family, host_key_policy) = if config_timeout.is_zero() {
+            (SshAddressFamily::Any, crate::HostKeyPolicy::HonorConfig)
+        } else {
+            resolve_ssh_config(&base_session, config_timeout, cleanup)
+                .await
+                .map_or(
+                    (SshAddressFamily::Any, crate::HostKeyPolicy::HonorConfig),
+                    |resolved| (resolved.address_family, resolved.host_key_policy()),
+                )
+        };
         let exclusions: std::sync::Arc<[std::path::PathBuf]> = local_operand_roots.to_vec().into();
         let preparation = crate::PreparationContext::uncancelled(cleanup.clone())
             .with_control_directory_exclusions(exclusions);
         let unpinned_opts = crate::SshConnectOptions {
             keepalive_sec,
             agent_forward: crate::AgentForwardMode::Off,
-            host_key_policy: crate::HostKeyPolicy::AutoAccept,
+            host_key_policy,
             hostname_override: None,
         };
-        let pinned_candidate =
-            pinned_session_and_options(&base_session, source_node_endpoint, keepalive_sec);
+        let pinned_candidate = resolve_pinned_session_and_options(
+            &base_session,
+            source_node_endpoint,
+            keepalive_sec,
+            host_key_policy,
+            deadline,
+            cleanup,
+        )
+        .await;
         let (primary_session, extra_primary_session, extra_primary_opts, extra_pinned) =
             connect_verified_three_host_primary(
                 &base_session,
@@ -1041,6 +1140,7 @@ fn pinned_session_and_options(
     base: &crate::SshSession,
     node_endpoint: Option<std::net::SocketAddr>,
     keepalive_sec: u64,
+    host_key_policy: crate::HostKeyPolicy,
 ) -> Option<(crate::SshSession, crate::SshConnectOptions)> {
     let endpoint = usable_node_endpoint(base, node_endpoint)?;
     let already_exact = base
@@ -1060,10 +1160,44 @@ fn pinned_session_and_options(
     let options = crate::SshConnectOptions {
         keepalive_sec,
         agent_forward: crate::AgentForwardMode::Off,
-        host_key_policy: crate::HostKeyPolicy::AutoAccept,
+        host_key_policy,
         hostname_override: Some(endpoint.ip()),
     };
     Some((pinned_session, options))
+}
+
+async fn resolve_pinned_session_and_options(
+    base: &crate::SshSession,
+    node_endpoint: Option<std::net::SocketAddr>,
+    keepalive_sec: u64,
+    base_host_key_policy: crate::HostKeyPolicy,
+    deadline: Option<tokio::time::Instant>,
+    cleanup: &crate::RemoteCleanup,
+) -> Option<(crate::SshSession, crate::SshConnectOptions)> {
+    let (pinned_session, mut pinned_opts) =
+        pinned_session_and_options(base, node_endpoint, keepalive_sec, base_host_key_policy)?;
+    // when base resolved to TOFU `AcceptNew`, re-evaluate `ssh -G` with `-o HostName=<ip>` and
+    // `-p <port>` so OpenSSH `Match host` / `Match port` `StrictHostKeyChecking yes` rules are
+    // never bypassed by CLI `-o StrictHostKeyChecking=accept-new`.
+    if pinned_opts.host_key_policy == crate::HostKeyPolicy::AcceptNew {
+        let config_timeout =
+            (remaining_budget(deadline) / 2).min(std::time::Duration::from_secs(5));
+        pinned_opts.host_key_policy = if config_timeout.is_zero() {
+            crate::HostKeyPolicy::HonorConfig
+        } else {
+            resolve_ssh_config_with_override(
+                &pinned_session,
+                pinned_opts.hostname_override,
+                config_timeout,
+                cleanup,
+            )
+            .await
+            .map_or(crate::HostKeyPolicy::HonorConfig, |resolved| {
+                resolved.host_key_policy()
+            })
+        };
+    }
+    Some((pinned_session, pinned_opts))
 }
 
 async fn connect_verified_three_host_primary(
@@ -1150,11 +1284,15 @@ async fn connect_verified_three_host_primary(
                 // when destination discovers a reachable node endpoint distinct from any
                 // already-failed source_node_endpoint, use it to pin extra tunnels 2..=K
                 if discovered_endpoint != source_node_endpoint || pinned_candidate.is_none() {
-                    extra_pinned = pinned_session_and_options(
+                    extra_pinned = resolve_pinned_session_and_options(
                         base_session,
                         discovered_endpoint,
                         unpinned_opts.keepalive_sec,
-                    );
+                        unpinned_opts.host_key_policy,
+                        deadline,
+                        &preparation.cleanup,
+                    )
+                    .await;
                 }
             }
             Ok((actual, _)) => {
@@ -1640,6 +1778,7 @@ hostname 10.20.30.40
 port 2222
 forwardagent yes
 addressfamily inet6
+stricthostkeychecking ask
 proxyjump jump.internal
 ";
         let resolved = parse_ssh_g_output(output, &fallback).unwrap();
@@ -1654,10 +1793,79 @@ proxyjump jump.internal
                 },
                 forward_agent_enabled: true,
                 address_family: SshAddressFamily::Inet6,
+                strict_host_key_checking: SshStrictHostKeyChecking::Ask,
                 proxy_jump: Some("jump.internal".to_owned()),
                 proxy_command: None,
             }
         );
+        assert_eq!(resolved.host_key_policy(), crate::HostKeyPolicy::AcceptNew);
+    }
+
+    #[test]
+    fn parse_ssh_g_output_maps_strict_host_key_checking_to_tofu_or_honor_config() {
+        let fallback = crate::SshSession {
+            user: None,
+            host: "host".to_owned(),
+            port: None,
+        };
+        for (line, expected_mode, expected_policy) in [
+            (
+                "stricthostkeychecking ask\n",
+                SshStrictHostKeyChecking::Ask,
+                crate::HostKeyPolicy::AcceptNew,
+            ),
+            (
+                "stricthostkeychecking true\n",
+                SshStrictHostKeyChecking::Yes,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "stricthostkeychecking yes\n",
+                SshStrictHostKeyChecking::Yes,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "stricthostkeychecking accept-new\n",
+                SshStrictHostKeyChecking::AcceptNew,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "stricthostkeychecking false\n",
+                SshStrictHostKeyChecking::No,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "stricthostkeychecking no\n",
+                SshStrictHostKeyChecking::No,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "stricthostkeychecking off\n",
+                SshStrictHostKeyChecking::No,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "stricthostkeychecking future-strict-mode\n",
+                SshStrictHostKeyChecking::Unknown,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+            (
+                "",
+                SshStrictHostKeyChecking::Unknown,
+                crate::HostKeyPolicy::HonorConfig,
+            ),
+        ] {
+            let resolved = parse_ssh_g_output(line, &fallback).unwrap();
+            assert_eq!(
+                resolved.strict_host_key_checking, expected_mode,
+                "unexpected parsed mode for {line:?}"
+            );
+            assert_eq!(
+                resolved.host_key_policy(),
+                expected_policy,
+                "unexpected HostKeyPolicy for {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -1671,6 +1879,7 @@ proxyjump jump.internal
             },
             forward_agent_enabled: false,
             address_family: SshAddressFamily::Any,
+            strict_host_key_checking: SshStrictHostKeyChecking::Ask,
             proxy_jump: None,
             proxy_command: None,
         };
@@ -1787,6 +1996,7 @@ proxyjump jump.internal
                 },
                 forward_agent_enabled: false,
                 address_family: SshAddressFamily::Any,
+                strict_host_key_checking: SshStrictHostKeyChecking::Unknown,
                 proxy_jump: None,
                 proxy_command: None,
             }
@@ -2162,6 +2372,7 @@ proxyjump jump.internal
         let cleanup = crate::RemoteCleanup::new().unwrap();
         let err = resolve_ssh_config_with_program(
             &crate::SshSession::local(),
+            None,
             &fake_ssh,
             std::time::Duration::from_secs(5),
             &cleanup,

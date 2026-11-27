@@ -307,6 +307,7 @@ impl SupervisedSshMaster {
     fn into_managed(
         mut self,
         session: openssh::Session,
+        host_key_policy: HostKeyPolicy,
         cleanup: RemoteCleanup,
     ) -> ManagedSshSession {
         let launcher = self
@@ -317,7 +318,13 @@ impl SupervisedSshMaster {
             .control_directory
             .take()
             .expect("supervised SSH master takes its control directory once");
-        ManagedSshSession::new(session, launcher, control_directory, cleanup)
+        ManagedSshSession::new(
+            session,
+            launcher,
+            control_directory,
+            host_key_policy,
+            cleanup,
+        )
     }
 }
 
@@ -1293,6 +1300,7 @@ struct ManagedSshSessionInner {
     session: Option<openssh::Session>,
     launcher: Option<std::process::Child>,
     control_directory: Option<std::path::PathBuf>,
+    host_key_policy: HostKeyPolicy,
     next_exec_log_id: std::sync::atomic::AtomicU64,
     cleanup: RemoteCleanup,
 }
@@ -1334,12 +1342,14 @@ impl ManagedSshSession {
         session: openssh::Session,
         launcher: std::process::Child,
         control_directory: std::path::PathBuf,
+        host_key_policy: HostKeyPolicy,
         cleanup: RemoteCleanup,
     ) -> Self {
         Self(std::sync::Arc::new(ManagedSshSessionInner {
             session: Some(session),
             launcher: Some(launcher),
             control_directory: Some(control_directory),
+            host_key_policy,
             next_exec_log_id: std::sync::atomic::AtomicU64::new(0),
             cleanup,
         }))
@@ -1347,6 +1357,10 @@ impl ManagedSshSession {
 
     pub(crate) fn cleanup(&self) -> RemoteCleanup {
         self.0.cleanup.clone()
+    }
+
+    pub(crate) fn host_key_policy(&self) -> HostKeyPolicy {
+        self.0.host_key_policy
     }
 
     pub(crate) fn control_path(&self) -> std::path::PathBuf {
@@ -1935,11 +1949,17 @@ pub use common::is_localhost;
 /// Host-key verification policy for an SSH master connection.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum HostKeyPolicy {
-    /// Pass `-o StrictHostKeyChecking=no` (default for ordinary non-agent-forwarded sessions).
+    /// Inspect `ssh -G` for this host and upgrade OpenSSH's default `ask` (which cannot prompt
+    /// under `BatchMode=yes`) to TOFU `accept-new`, while honoring explicit `yes`, `accept-new`,
+    /// and `no` settings in `~/.ssh/config`. Fails safe to [`Self::HonorConfig`] if `ssh -G`
+    /// fails, and never upgrades when agent forwarding is active.
     #[default]
-    AutoAccept,
-    /// Omit `StrictHostKeyChecking=no` so the user's configured OpenSSH host-key verification
-    /// policy applies (required whenever an agent-forwarding session may follow on the same host).
+    AcceptNewOnAsk,
+    /// Pass `-o StrictHostKeyChecking=accept-new` directly (resolved from `ask` via `ssh -G`).
+    AcceptNew,
+    /// Omit `-o StrictHostKeyChecking=...` so the user's configured OpenSSH policy applies
+    /// untouched (always used when agent forwarding is active or when `~/.ssh/config` sets an
+    /// explicit policy).
     HonorConfig,
 }
 
@@ -1962,7 +1982,7 @@ pub(crate) async fn setup_ssh_session(
     agent_forward: AgentForwardMode,
 ) -> anyhow::Result<ManagedSshSession> {
     let host_key_policy = if agent_forward == AgentForwardMode::Off {
-        HostKeyPolicy::AutoAccept
+        HostKeyPolicy::AcceptNewOnAsk
     } else {
         HostKeyPolicy::HonorConfig
     };
@@ -1980,17 +2000,85 @@ pub(crate) async fn setup_ssh_session(
     .await
 }
 
+async fn resolve_effective_host_key_policy(
+    session: &SshSession,
+    hostname_override: Option<std::net::IpAddr>,
+    preparation: &PreparationContext,
+    deadline: BootstrapDeadline,
+) -> anyhow::Result<HostKeyPolicy> {
+    if preparation.cancellation.is_cancelled() {
+        return Err(PreparationContext::cancellation_error());
+    }
+    let config_timeout = (deadline.0 / 2).min(std::time::Duration::from_secs(5));
+    if config_timeout.is_zero() {
+        return Ok(HostKeyPolicy::HonorConfig);
+    }
+    let session_owned = session.clone();
+    let cleanup = preparation.cleanup.clone();
+    let resolve = tokio::spawn(async move {
+        ssh_tunnel::resolve_ssh_config_with_override(
+            &session_owned,
+            hostname_override,
+            config_timeout,
+            &cleanup,
+        )
+        .await
+    });
+    match preparation
+        .run_abortable_with_deadline(
+            resolve,
+            "SSH config resolution",
+            BootstrapDeadline::new(config_timeout),
+        )
+        .await
+    {
+        Ok(resolved) => Ok(resolved.host_key_policy()),
+        Err(error) => {
+            if preparation.cancellation.is_cancelled() {
+                Err(error)
+            } else {
+                tracing::debug!(
+                    host = %session.host,
+                    "could not resolve StrictHostKeyChecking via `ssh -G` (failing safe to HonorConfig): {error:#}"
+                );
+                Ok(HostKeyPolicy::HonorConfig)
+            }
+        }
+    }
+}
+
 pub(crate) async fn setup_ssh_session_with_options(
     session: &SshSession,
     preparation: &PreparationContext,
     deadline: BootstrapDeadline,
-    options: SshConnectOptions,
+    mut options: SshConnectOptions,
 ) -> anyhow::Result<ManagedSshSession> {
+    let started = std::time::Instant::now();
+    if options.host_key_policy == HostKeyPolicy::AcceptNewOnAsk {
+        options.host_key_policy = if options.agent_forward != AgentForwardMode::Off {
+            HostKeyPolicy::HonorConfig
+        } else {
+            resolve_effective_host_key_policy(
+                session,
+                options.hostname_override,
+                preparation,
+                deadline,
+            )
+            .await?
+        };
+    }
+    let remaining = deadline.0.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!(
+            "SSH session setup timed out after {}",
+            humantime::format_duration(deadline.0)
+        );
+    }
     setup_ssh_session_with_program(
         session,
         preparation,
         std::path::Path::new("ssh"),
-        deadline,
+        BootstrapDeadline::new(remaining),
         options,
     )
     .await
@@ -2131,14 +2219,14 @@ fn ssh_master_args(
         "-o".into(),
         "PermitLocalCommand=no".into(),
     ];
-    // preserve the user's StrictHostKeyChecking policy whenever SSH agent forwarding is active or
-    // may follow on the same host (including earlier `~` home lookups) so an unknown host key is
-    // never silently recorded into known_hosts before delegating the signing agent
-    let honor_host_key = options.host_key_policy == HostKeyPolicy::HonorConfig
-        || options.agent_forward != AgentForwardMode::Off;
-    if !honor_host_key {
+    // never disable host-key verification with `StrictHostKeyChecking=no`. Only upgrade OpenSSH's
+    // interactive `ask` default (resolved via `ssh -G` to `HostKeyPolicy::AcceptNew`) to TOFU
+    // `accept-new`, and never when SSH agent forwarding is active or may follow on the same host.
+    if options.host_key_policy == HostKeyPolicy::AcceptNew
+        && options.agent_forward == AgentForwardMode::Off
+    {
         args.push("-o".into());
-        args.push("StrictHostKeyChecking=no".into());
+        args.push("StrictHostKeyChecking=accept-new".into());
     }
     match options.agent_forward {
         AgentForwardMode::Off => {
@@ -2261,7 +2349,14 @@ async fn launch_ssh_master(
     // command, which would create an uninterruptible pre-deadline PATH/exec window.
     let session =
         openssh::Session::resume_mux(control_path.into_boxed_path(), Some(log.into_boxed_path()));
-    Ok(preparing.into_managed(session, cleanup))
+    let effective_host_key_policy = if options.host_key_policy == HostKeyPolicy::AcceptNew
+        && options.agent_forward == AgentForwardMode::Off
+    {
+        HostKeyPolicy::AcceptNew
+    } else {
+        HostKeyPolicy::HonorConfig
+    };
+    Ok(preparing.into_managed(session, effective_host_key_policy, cleanup))
 }
 
 /// Where to put the SSH connection-multiplexing socket.
@@ -2422,7 +2517,7 @@ pub async fn get_remote_home_for_session_with_timeout(
         SshConnectOptions {
             keepalive_sec,
             agent_forward: AgentForwardMode::Off,
-            host_key_policy: HostKeyPolicy::AutoAccept,
+            host_key_policy: HostKeyPolicy::AcceptNewOnAsk,
             hostname_override: None,
         },
     )
@@ -3547,7 +3642,7 @@ async fn prepare_rcpd_with_context(
         }
         None => {
             let host_key_policy = if agent_forward == AgentForwardMode::Off {
-                HostKeyPolicy::AutoAccept
+                HostKeyPolicy::AcceptNewOnAsk
             } else {
                 HostKeyPolicy::HonorConfig
             };
@@ -3774,16 +3869,39 @@ fn ssh_mux_exec_args(
 }
 
 impl PreparedRcpd {
-    /// Path to this prepared SSH session's active OpenSSH multiplex control socket.
-    #[must_use]
-    pub fn control_path(&self) -> std::path::PathBuf {
-        self.session.control_path()
-    }
-
-    /// SSH session target that owns this prepared remote endpoint.
-    #[must_use]
-    pub fn remote(&self) -> &SshSession {
-        &self.remote
+    /// Open `1..=requested_tunnels` SSH port forwards reusing this prepared master session as
+    /// tunnel #1 and spawning up to `requested_tunnels - 1` verified extra tunnels in parallel.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_ssh_tunnels(
+        &self,
+        direction: ssh_tunnel::ForwardDirection,
+        target_control: std::net::SocketAddr,
+        target_data: Option<std::net::SocketAddr>,
+        requested_tunnels: usize,
+        address_family: ssh_tunnel::SshAddressFamily,
+        expected_peer: Option<&protocol::PeerIdentity>,
+        node_endpoint: Option<std::net::SocketAddr>,
+        keepalive_sec: u64,
+        timeout: std::time::Duration,
+        cleanup: &RemoteCleanup,
+        local_operand_roots: &[std::path::PathBuf],
+    ) -> anyhow::Result<ssh_tunnel::SshTunnelSet> {
+        ssh_tunnel::SshTunnelSet::open_on_existing_session(
+            direction,
+            &self.session,
+            &self.remote,
+            target_control,
+            target_data,
+            requested_tunnels,
+            address_family,
+            expected_peer,
+            node_endpoint,
+            keepalive_sec,
+            timeout,
+            cleanup,
+            local_operand_roots,
+        )
+        .await
     }
 
     /// Probe the peer identity and concrete `SSH_CONNECTION` server endpoint of this prepared
@@ -5547,7 +5665,7 @@ mod tests {
             ] {
                 let tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
                     direction,
-                    &primary.control_path(),
+                    &primary,
                     &session,
                     target_control,
                     Some(target_data),
@@ -6156,6 +6274,293 @@ mod tests {
             ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
         )]
         #[tokio::test]
+        async fn test_remote_host_key_verification_tofu_and_ssh_config_policies() {
+            const MARKER: &str = "RCP_TEST_HOST_KEY_TOFU_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let sshd = PrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+                let home = tempfile::tempdir().unwrap();
+                let alt_host_key = home.path().join("alt_host_key");
+                let status = std::process::Command::new("ssh-keygen")
+                    .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                    .arg(&alt_host_key)
+                    .status()
+                    .expect("failed to generate alternate host key");
+                assert!(status.success(), "ssh-keygen failed for alternate host key");
+                let wrong_pub = std::fs::read_to_string(alt_host_key.with_extension("pub"))
+                    .unwrap()
+                    .trim()
+                    .to_owned();
+                let known_hosts = home.path().join(".ssh/known_hosts");
+                let path_env = write_ssh_config_wrapper(
+                    home.path(),
+                    &format!(
+                        "Host default-host\n\
+                           HostName 127.0.0.1\n\
+                           Port {port}\n\
+                           IdentityFile {key}\n\
+                           IdentitiesOnly yes\n\
+                           UserKnownHostsFile {kh}\n\
+                         Host strict-host\n\
+                           HostName 127.0.0.1\n\
+                           Port {port}\n\
+                           IdentityFile {key}\n\
+                           IdentitiesOnly yes\n\
+                           StrictHostKeyChecking yes\n\
+                           UserKnownHostsFile {kh}\n\
+                         Host insecure-host\n\
+                           HostName 127.0.0.1\n\
+                           Port {port}\n\
+                           IdentityFile {key}\n\
+                           IdentitiesOnly yes\n\
+                           StrictHostKeyChecking no\n\
+                           UserKnownHostsFile {kh}\n\
+                         Host agent-default-host\n\
+                           HostName 127.0.0.1\n\
+                           Port {port}\n\
+                           IdentityFile {key}\n\
+                           IdentitiesOnly yes\n\
+                           ForwardAgent yes\n\
+                           UserKnownHostsFile {kh}\n\
+                         Host pinned-alias\n\
+                           HostName 127.0.0.2\n\
+                           Port {port}\n\
+                           IdentityFile {key}\n\
+                           IdentitiesOnly yes\n\
+                           UserKnownHostsFile {kh}\n\
+                         Match host 127.0.0.1 originalhost pinned-alias\n\
+                           StrictHostKeyChecking yes\n",
+                        port = sshd.addr.port(),
+                        key = sshd.client_key.display(),
+                        kh = known_hosts.display(),
+                    ),
+                );
+                std::fs::write(&known_hosts, "").unwrap();
+                let port_str = sshd.addr.port().to_string();
+                let known_hosts_str = known_hosts.to_string_lossy().into_owned();
+                run_isolated_ssh_test_child(
+                    "tests::localhost_ssh_tests::test_remote_host_key_verification_tofu_and_ssh_config_policies",
+                    MARKER,
+                    &path_env,
+                    &[
+                        ("RCP_TEST_PORT", &port_str),
+                        ("RCP_TEST_KNOWN_HOSTS", &known_hosts_str),
+                        ("RCP_TEST_HOST_PUB", &sshd.host_pub_key),
+                        ("RCP_TEST_WRONG_PUB", &wrong_pub),
+                    ],
+                );
+                drop(sshd);
+                return;
+            }
+            let port: u16 = std::env::var("RCP_TEST_PORT").unwrap().parse().unwrap();
+            let known_hosts =
+                std::path::PathBuf::from(std::env::var("RCP_TEST_KNOWN_HOSTS").unwrap());
+            let host_pub = std::env::var("RCP_TEST_HOST_PUB").unwrap();
+            let wrong_pub = std::env::var("RCP_TEST_WRONG_PUB").unwrap();
+            let cleanup = RemoteCleanup::new().unwrap();
+            let deadline = BootstrapDeadline::new(DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT);
+            let make_session = |host: &str| SshSession {
+                user: None,
+                host: host.to_owned(),
+                port: None,
+            };
+            // 1. default config (`StrictHostKeyChecking` omitted -> `ask`): upgraded to TOFU
+            // `accept-new` when agent forwarding is off — first contact records the host key,
+            // subsequent contact succeeds, and a changed host key in `known_hosts` hard-fails.
+            std::fs::write(&known_hosts, "").unwrap();
+            let first = setup_ssh_session(
+                &make_session("default-host"),
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("TOFU first contact must succeed: {e:#}"));
+            drop(first);
+            let recorded = std::fs::read_to_string(&known_hosts).unwrap();
+            assert!(
+                !recorded.trim().is_empty(),
+                "TOFU accept-new must record the new host key in known_hosts"
+            );
+            let second = setup_ssh_session(
+                &make_session("default-host"),
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("repeat connect with recorded key must succeed: {e:#}"));
+            drop(second);
+            std::fs::write(&known_hosts, format!("[127.0.0.1]:{port} {wrong_pub}\n")).unwrap();
+            let mitm_err = setup_ssh_session(
+                &make_session("default-host"),
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .expect_err("TOFU accept-new must reject a changed host key");
+            let mitm_msg = format!("{mitm_err:#}");
+            assert!(
+                mitm_msg.contains("Host key verification failed")
+                    || mitm_msg.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"),
+                "expected host key change rejection under TOFU: {mitm_msg}"
+            );
+            // 2. explicit `StrictHostKeyChecking yes` is honored even when agent forwarding is off.
+            std::fs::write(&known_hosts, "").unwrap();
+            let strict_err = setup_ssh_session(
+                &make_session("strict-host"),
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .expect_err("explicit StrictHostKeyChecking yes must reject unknown host");
+            assert!(
+                format!("{strict_err:#}").contains("Host key verification failed"),
+                "expected host key failure for strict-host: {strict_err:#}"
+            );
+            assert!(
+                std::fs::read_to_string(&known_hosts)
+                    .unwrap()
+                    .trim()
+                    .is_empty(),
+                "explicit StrictHostKeyChecking yes must not populate known_hosts"
+            );
+            std::fs::write(&known_hosts, format!("[127.0.0.1]:{port} {host_pub}\n")).unwrap();
+            let strict_ok = setup_ssh_session(
+                &make_session("strict-host"),
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("strict-host must succeed once trusted: {e:#}"));
+            drop(strict_ok);
+            // 3. explicit `StrictHostKeyChecking no` in `~/.ssh/config` is honored untouched.
+            std::fs::write(&known_hosts, format!("[127.0.0.1]:{port} {wrong_pub}\n")).unwrap();
+            let insecure_ok = setup_ssh_session(
+                &make_session("insecure-host"),
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                15,
+                AgentForwardMode::Off,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("explicit StrictHostKeyChecking no must succeed: {e:#}"));
+            drop(insecure_ok);
+            // 4. agent forwarding must NEVER upgrade default `ask` to TOFU `accept-new`.
+            std::fs::write(&known_hosts, "").unwrap();
+            for mode in [AgentForwardMode::ForceOn, AgentForwardMode::InheritConfig] {
+                let err = setup_ssh_session(
+                    &make_session("agent-default-host"),
+                    &PreparationContext::uncancelled(cleanup.clone()),
+                    deadline,
+                    15,
+                    mode,
+                )
+                .await
+                .expect_err("agent forwarding must reject unknown host even under default ask");
+                assert!(
+                    format!("{err:#}").contains("Host key verification failed"),
+                    "expected host key failure for agent-default-host ({mode:?}): {err:#}"
+                );
+            }
+            assert!(
+                std::fs::read_to_string(&known_hosts)
+                    .unwrap()
+                    .trim()
+                    .is_empty(),
+                "agent forwarding must not record unknown host key under default ask"
+            );
+            std::fs::write(&known_hosts, format!("[127.0.0.1]:{port} {host_pub}\n")).unwrap();
+            for mode in [AgentForwardMode::ForceOn, AgentForwardMode::InheritConfig] {
+                let ok = setup_ssh_session(
+                    &make_session("agent-default-host"),
+                    &PreparationContext::uncancelled(cleanup.clone()),
+                    deadline,
+                    15,
+                    mode,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("agent-default-host ({mode:?}) must succeed once trusted: {e:#}")
+                });
+                drop(ok);
+            }
+            // 5. `-o HostName=<ip>` pinning must honor `Match host` `StrictHostKeyChecking yes`
+            // rules even when the unpinned alias defaults to `ask`.
+            let pinned_alias = make_session("pinned-alias");
+            let unpinned_cfg = ssh_tunnel::resolve_ssh_config(
+                &pinned_alias,
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                unpinned_cfg.strict_host_key_checking,
+                ssh_tunnel::SshStrictHostKeyChecking::Ask
+            );
+            let pinned_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+            let pinned_cfg = ssh_tunnel::resolve_ssh_config_with_override(
+                &pinned_alias,
+                Some(pinned_ip),
+                DEFAULT_REMOTE_BOOTSTRAP_TIMEOUT,
+                &cleanup,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                pinned_cfg.strict_host_key_checking,
+                ssh_tunnel::SshStrictHostKeyChecking::Yes
+            );
+            std::fs::write(&known_hosts, "").unwrap();
+            let pinned_err = setup_ssh_session_with_options(
+                &pinned_alias,
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                SshConnectOptions {
+                    keepalive_sec: 15,
+                    agent_forward: AgentForwardMode::Off,
+                    host_key_policy: HostKeyPolicy::AcceptNewOnAsk,
+                    hostname_override: Some(pinned_ip),
+                },
+            )
+            .await
+            .expect_err("Match host StrictHostKeyChecking yes must not be bypassed by pinning");
+            assert!(
+                format!("{pinned_err:#}").contains("Host key verification failed"),
+                "expected Match host strict failure under hostname_override: {pinned_err:#}"
+            );
+            std::fs::write(&known_hosts, format!("[127.0.0.1]:{port} {host_pub}\n")).unwrap();
+            let pinned_ok = setup_ssh_session_with_options(
+                &pinned_alias,
+                &PreparationContext::uncancelled(cleanup.clone()),
+                deadline,
+                SshConnectOptions {
+                    keepalive_sec: 15,
+                    agent_forward: AgentForwardMode::Off,
+                    host_key_policy: HostKeyPolicy::AcceptNewOnAsk,
+                    hostname_override: Some(pinned_ip),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("pinned Match host must succeed once trusted: {e:#}"));
+            drop(pinned_ok);
+            cleanup.finish();
+        }
+
+        #[cfg(target_os = "linux")]
+        #[cfg_attr(
+            rcp_nix_sandbox,
+            ignore = "Nix sandbox lacks the SSH client and authenticated localhost service"
+        )]
+        #[tokio::test]
         async fn test_remote_missing_forward_agent_socket_kept_out_of_readiness_stream() {
             use std::os::unix::fs::PermissionsExt;
             const MARKER: &str = "RCP_TEST_MISSING_AGENT_SOCK_CHILD";
@@ -6242,7 +6647,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let ok_control_dir = prepared_ok.control_path().parent().unwrap().to_path_buf();
+            let ok_control_dir = prepared_ok
+                .session
+                .control_path()
+                .parent()
+                .unwrap()
+                .to_path_buf();
             let process = prepared_ok
                 .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
                 .await
@@ -6263,7 +6673,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let fail_control_dir = prepared_fail.control_path().parent().unwrap().to_path_buf();
+            let fail_control_dir = prepared_fail
+                .session
+                .control_path()
+                .parent()
+                .unwrap()
+                .to_path_buf();
             let err = match prepared_fail
                 .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
                 .await
@@ -6295,7 +6710,12 @@ mod tests {
             )
             .await
             .unwrap();
-            let late_control_dir = prepared_late.control_path().parent().unwrap().to_path_buf();
+            let late_control_dir = prepared_late
+                .session
+                .control_path()
+                .parent()
+                .unwrap()
+                .to_path_buf();
             let late_process = prepared_late
                 .spawn(&test_rcpd_config(), None, protocol::RcpdRole::Destination)
                 .await
@@ -6484,7 +6904,7 @@ mod tests {
             // tunnel #1 on node A).
             let tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
                 ssh_tunnel::ForwardDirection::Local,
-                &primary.control_path(),
+                &primary,
                 &lb_session,
                 target_control,
                 Some(target_data),
@@ -6618,7 +7038,7 @@ mod tests {
                 std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port_b));
             let fallback_tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
                 ssh_tunnel::ForwardDirection::Local,
-                &primary.control_path(),
+                &primary,
                 &direct_node_a,
                 target_control,
                 Some(target_data),
@@ -6643,7 +7063,7 @@ mod tests {
             // unverified extra tunnels and must preserve requested_tunnels for notice reporting
             let unverified_tunnels = ssh_tunnel::SshTunnelSet::open_on_existing_session(
                 ssh_tunnel::ForwardDirection::Remote,
-                &primary.control_path(),
+                &primary,
                 &direct_node_a,
                 target_control,
                 Some(target_data),
@@ -6951,7 +7371,7 @@ mod tests {
         let opts = |keepalive_sec, agent_forward| SshConnectOptions {
             keepalive_sec,
             agent_forward,
-            host_key_policy: HostKeyPolicy::AutoAccept,
+            host_key_policy: HostKeyPolicy::AcceptNew,
             hostname_override: None,
         };
         let disabled: Vec<String> =
@@ -6960,7 +7380,7 @@ mod tests {
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect();
         for expected in [
-            "StrictHostKeyChecking=no",
+            "StrictHostKeyChecking=accept-new",
             "ClearAllForwardings=yes",
             "ExitOnForwardFailure=no",
             "GatewayPorts=no",
@@ -6972,6 +7392,10 @@ mod tests {
                 "ssh_master_args must set -o {expected}: {disabled:?}"
             );
         }
+        assert!(
+            !disabled.iter().any(|arg| arg == "StrictHostKeyChecking=no"),
+            "ssh_master_args must never pass StrictHostKeyChecking=no: {disabled:?}"
+        );
         assert!(
             disabled
                 .windows(2)
@@ -7048,7 +7472,27 @@ mod tests {
             !honor_no_agent
                 .iter()
                 .any(|arg| arg.starts_with("StrictHostKeyChecking=")),
-            "HostKeyPolicy::HonorConfig must omit StrictHostKeyChecking=no even when agent is off: {honor_no_agent:?}"
+            "HostKeyPolicy::HonorConfig must omit StrictHostKeyChecking even when agent is off: {honor_no_agent:?}"
+        );
+        let unresolved: Vec<String> = ssh_master_args(
+            &session,
+            log,
+            socket,
+            SshConnectOptions {
+                keepalive_sec: 0,
+                agent_forward: AgentForwardMode::Off,
+                host_key_policy: HostKeyPolicy::AcceptNewOnAsk,
+                hostname_override: None,
+            },
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+        assert!(
+            !unresolved
+                .iter()
+                .any(|arg| arg.starts_with("StrictHostKeyChecking=")),
+            "unresolved HostKeyPolicy::AcceptNewOnAsk must fail safe and omit StrictHostKeyChecking: {unresolved:?}"
         );
         let pinned: Vec<String> = ssh_master_args(
             &session,
@@ -7057,7 +7501,7 @@ mod tests {
             SshConnectOptions {
                 keepalive_sec: 0,
                 agent_forward: AgentForwardMode::Off,
-                host_key_policy: HostKeyPolicy::AutoAccept,
+                host_key_policy: HostKeyPolicy::AcceptNew,
                 hostname_override: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                     10, 20, 30, 40,
                 ))),
@@ -7116,6 +7560,28 @@ mod tests {
                 .any(|pair| pair == ["-o", "ServerAliveCountMax=5"]),
             "keepalive_sec=120 should use ServerAliveCountMax=5 (20 * (5 + 1) = 120s): {default_args:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_host_key_policy_propagates_cancellation() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let cleanup = RemoteCleanup::new().unwrap();
+        let preparation = PreparationContext::new(cancellation, cleanup.clone());
+        let err = resolve_effective_host_key_policy(
+            &SshSession::local(),
+            None,
+            &preparation,
+            BootstrapDeadline::new(std::time::Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("pre-cancelled preparation must fail instead of falling back to HonorConfig");
+        assert!(
+            err.downcast_ref::<PeerPreparationCancelled>().is_some(),
+            "expected preparation cancellation error, got: {err:#}"
+        );
+        drop(preparation);
+        cleanup.finish();
     }
 
     #[tokio::test]
@@ -7183,7 +7649,7 @@ mod tests {
                 SshConnectOptions {
                     keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                     agent_forward: AgentForwardMode::Off,
-                    host_key_policy: HostKeyPolicy::AutoAccept,
+                    host_key_policy: HostKeyPolicy::HonorConfig,
                     hostname_override: None,
                 },
             )
@@ -7272,7 +7738,7 @@ mod tests {
                 SshConnectOptions {
                     keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                     agent_forward: AgentForwardMode::Off,
-                    host_key_policy: HostKeyPolicy::AutoAccept,
+                    host_key_policy: HostKeyPolicy::HonorConfig,
                     hostname_override: None,
                 },
             )
@@ -7569,7 +8035,7 @@ mod tests {
             SshConnectOptions {
                 keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                 agent_forward: AgentForwardMode::Off,
-                host_key_policy: HostKeyPolicy::AutoAccept,
+                host_key_policy: HostKeyPolicy::HonorConfig,
                 hostname_override: None,
             },
         )
@@ -7630,7 +8096,7 @@ mod tests {
                 SshConnectOptions {
                     keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                     agent_forward: AgentForwardMode::Off,
-                    host_key_policy: HostKeyPolicy::AutoAccept,
+                    host_key_policy: HostKeyPolicy::HonorConfig,
                     hostname_override: None,
                 },
             )
@@ -7726,7 +8192,7 @@ mod tests {
                 SshConnectOptions {
                     keepalive_sec: DEFAULT_REMOTE_KEEPALIVE_SEC,
                     agent_forward: AgentForwardMode::Off,
-                    host_key_policy: HostKeyPolicy::AutoAccept,
+                    host_key_policy: HostKeyPolicy::HonorConfig,
                     hostname_override: None,
                 },
             ))

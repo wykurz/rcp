@@ -43,8 +43,8 @@ Keep these boundaries intact when changing the component:
 - Compatibility means the full protocol-version string, not just the release number. See
   [version checking](../docs/remote_copy.md#version-checking).
 - Addresses and certificate identity have different roles. Fingerprints are exchanged through SSH;
-  TLS pinning does not independently establish that the SSH peer is the intended host. See the
-  [SSH host-verification limitation](../docs/security.md#ssh-host-verification-limitation).
+  TLS pinning does not independently establish that the SSH peer is the intended host. See
+  [SSH host-key verification](../docs/security.md#ssh-host-key-verification).
 - Connection acceptance, stream framing, and cancellation must preserve message boundaries. Keep
   socket setup in the shared helpers rather than adding unconfigured TCP paths in callers.
 - Completion and cleanup are part of the result, not detached background work. See

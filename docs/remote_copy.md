@@ -558,10 +558,18 @@ Key behavior:
   wrong backend. If `host2` cannot authenticate to `host1`, configure keys between them, pass
   `--ssh-forward-agent` (or enable `ForwardAgent` for `host2` in `~/.ssh/config`), open
   `--port-ranges` for direct TCP, or run `rcp` from `host1` or `host2`. When agent forwarding is
-  enabled or configured for the destination, `rcp` authenticates the destination first under the
-  user's configured `StrictHostKeyChecking` policy — before any source SSH connection can update
-  `known_hosts` (even across routes sharing a `HostKeyAlias`) — and retains that verified master
-  session for destination `~` home expansion (with agent forwarding disabled) and `rcpd` setup.
+  enabled or configured for the destination, `rcp` never upgrades `ask` to `accept-new` and
+  authenticates the destination first under the user's unmodified `StrictHostKeyChecking` policy —
+  before any source SSH connection can update `known_hosts` (even across routes sharing a
+  `HostKeyAlias`) — and retains that verified master session for destination `~` home expansion
+  (with agent forwarding disabled) and `rcpd` setup.
+- **SSH host-key verification**: `rcp` never passes `StrictHostKeyChecking=no`. Explicit
+  `StrictHostKeyChecking` settings in `~/.ssh/config` (`yes`, `accept-new`, `no`) are honored
+  untouched. When `~/.ssh/config` leaves OpenSSH's default `ask` (which cannot prompt under
+  `BatchMode=yes`), non-agent-forwarded connections automatically use TOFU
+  (`StrictHostKeyChecking=accept-new`), accepting unseen hosts on first contact while failing closed
+  if a known host's key changes. Configure `StrictHostKeyChecking yes` in `~/.ssh/config` to require
+  pre-populated `known_hosts` entries on first contact too.
 - **Flags interaction, firewalls & IPv6**: `--remote-transport=ssh` binds the source to loopback
   (`127.0.0.1`, or `::1` when the source requires IPv6) on an ephemeral port and warns and ignores
   `--port-ranges` and `--bind-ip`. `--remote-transport=auto` honors both flags during the direct-TCP
@@ -744,8 +752,8 @@ leaves a data connection with less than the profile's size logs a warning (visib
 
 ### Trust Model
 
-- SSH supplies the initial peer identity and fingerprints; see the
-  [host-verification limitation](security.md#ssh-host-verification-limitation)
+- SSH supplies the initial peer identity and fingerprints; see
+  [SSH host-key verification](security.md#ssh-host-key-verification)
 - All operations require SSH authentication first
 - Data transfers are encrypted with TLS 1.3 by default (certificate fingerprint pinning)
 - Use `--no-encryption` only on trusted networks where encryption overhead is undesirable

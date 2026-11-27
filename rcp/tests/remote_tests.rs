@@ -13646,3 +13646,264 @@ fn test_remote_ssh_auth_avoids_double_encryption_and_defaults_tunnels_to_streams
     );
     assert_eq!(get_file_content(&dst_auto.join("a.txt")), "hmac alpha");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_remote_host_key_tofu_and_changed_key_rejection() {
+    let home = tempfile::tempdir().unwrap();
+    let remote_home = tempfile::tempdir().unwrap();
+    let alt_host_key = home.path().join("alt_host_key");
+    let status = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+        .arg(&alt_host_key)
+        .status()
+        .expect("failed to generate alternate host key");
+    assert!(status.success(), "ssh-keygen failed for alternate host key");
+    let wrong_pub = std::fs::read_to_string(alt_host_key.with_extension("pub"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let sshd_local = TestPrivateSshd::start(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    let sshd_src = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            force_home: Some(remote_home.path()),
+            ..Default::default()
+        },
+    );
+    let sshd_dst = TestPrivateSshd::start_with_options(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        TestPrivateSshdOptions {
+            force_home: Some(remote_home.path()),
+            ..Default::default()
+        },
+    );
+    let local_known_hosts = home.path().join("local_known_hosts");
+    let master_known_hosts = home.path().join("master_known_hosts");
+    let strict_known_hosts = home.path().join("strict_known_hosts");
+    let tunnel_known_hosts = home.path().join("tunnel_known_hosts");
+    std::fs::write(&local_known_hosts, "").unwrap();
+    std::fs::write(&master_known_hosts, "").unwrap();
+    std::fs::write(&strict_known_hosts, "").unwrap();
+    std::fs::write(&tunnel_known_hosts, "").unwrap();
+    let path_env = write_test_ssh_config_wrapper(
+        home.path(),
+        &format!(
+            "Host localhost\n\
+               HostName 127.0.0.1\n\
+               Port {local_port}\n\
+               IdentityFile {local_key}\n\
+               IdentitiesOnly yes\n\
+               UserKnownHostsFile {local_kh}\n\
+             Host src-tofu\n\
+               HostName 127.0.0.1\n\
+               Port {src_port}\n\
+               IdentityFile {src_key}\n\
+               IdentitiesOnly yes\n\
+               UserKnownHostsFile {master_kh}\n\
+             Host dst-tofu\n\
+               HostName 127.0.0.1\n\
+               Port {dst_port}\n\
+               IdentityFile {dst_key}\n\
+               IdentitiesOnly yes\n\
+               UserKnownHostsFile {master_kh}\n\
+             Host src-strict\n\
+               HostName 127.0.0.1\n\
+               Port {src_port}\n\
+               IdentityFile {src_key}\n\
+               IdentitiesOnly yes\n\
+               StrictHostKeyChecking yes\n\
+               UserKnownHostsFile {strict_kh}\n\
+             Host 127.0.0.1\n\
+               IdentityFile {src_key}\n\
+               IdentityFile {dst_key}\n\
+               IdentitiesOnly yes\n\
+               UserKnownHostsFile {tunnel_kh}\n",
+            local_port = sshd_local.addr.port(),
+            src_port = sshd_src.addr.port(),
+            dst_port = sshd_dst.addr.port(),
+            local_key = sshd_local.client_key.display(),
+            src_key = sshd_src.client_key.display(),
+            dst_key = sshd_dst.client_key.display(),
+            local_kh = local_known_hosts.display(),
+            master_kh = master_known_hosts.display(),
+            strict_kh = strict_known_hosts.display(),
+            tunnel_kh = tunnel_known_hosts.display(),
+        ),
+    );
+    let rcpd_wrapper = write_test_rcpd_with_ssh_wrapper(home.path());
+    let rcpd_flag = format!("--rcpd-path={}", rcpd_wrapper.display());
+    let env = [("PATH", path_env.as_str()), ("SSH_AUTH_SOCK", "")];
+    let src_file = remote_home.path().join("tofu_src.txt");
+    create_test_file(&src_file, "tofu protected payload", 0o644);
+    let src_spec = format!("src-tofu:{}", src_file.to_str().unwrap());
+    let strict_src_spec = format!("src-strict:{}", src_file.to_str().unwrap());
+    // 1. default config (`StrictHostKeyChecking` omitted -> `ask`): first-contact multi-tunnel SSH
+    //    download succeeds via TOFU `accept-new` (including extra tunnel #2) and records the key.
+    let dst_local_ok = home.path().join("local_ok.txt");
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            "--ssh-tunnels=2",
+            &rcpd_flag,
+            &src_spec,
+            dst_local_ok.to_str().unwrap(),
+        ],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "TOFU first-contact multi-tunnel SSH download failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("Transferring file data over SSH (2 parallel tunnels)"),
+        "expected both primary and extra SSH tunnels to succeed under TOFU:\n{combined}"
+    );
+    assert_eq!(get_file_content(&dst_local_ok), "tofu protected payload");
+    assert!(
+        !std::fs::read_to_string(&master_known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "TOFU first contact must populate master_known_hosts"
+    );
+    // 2. replace the recorded key with a mismatched key: both direct TCP and SSH-tunneled copies
+    //    must fail closed instead of ignoring host-key changes.
+    std::fs::write(
+        &master_known_hosts,
+        format!("[127.0.0.1]:{} {wrong_pub}\n", sshd_src.addr.port()),
+    )
+    .unwrap();
+    for (transport, name) in [("tcp", "local_mitm_tcp.txt"), ("ssh", "local_mitm_ssh.txt")] {
+        let dst_mitm = home.path().join(name);
+        let transport_flag = format!("--remote-transport={transport}");
+        let out = run_rcp_with_args_home_and_env(
+            &[
+                &transport_flag,
+                &rcpd_flag,
+                &src_spec,
+                dst_mitm.to_str().unwrap(),
+            ],
+            home.path(),
+            &env,
+        );
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !out.status.success(),
+            "changed host key must fail closed under --remote-transport={transport}:\n{combined}"
+        );
+        assert!(
+            !dst_mitm.exists(),
+            "failed host-key verification must not create destination file ({transport})"
+        );
+        assert!(
+            combined.contains("Host key verification failed")
+                || combined.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"),
+            "expected host-key mismatch diagnostic ({transport}):\n{combined}"
+        );
+    }
+    // 3. explicit `StrictHostKeyChecking yes` in `~/.ssh/config` must reject unknown hosts.
+    let dst_strict = home.path().join("local_strict.txt");
+    let out = run_rcp_with_args_home_and_env(
+        &[&rcpd_flag, &strict_src_spec, dst_strict.to_str().unwrap()],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "explicit StrictHostKeyChecking yes must reject unknown host:\n{combined}"
+    );
+    assert!(!dst_strict.exists());
+    assert!(
+        combined.contains("Host key verification failed"),
+        "expected host-key verification failure for src-strict:\n{combined}"
+    );
+    assert!(
+        std::fs::read_to_string(&strict_known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "explicit StrictHostKeyChecking yes must not populate strict_known_hosts"
+    );
+    // 4. 3-host destination -> source SSH tunnels also enforce TOFU and reject changed host keys.
+    std::fs::write(&master_known_hosts, "").unwrap();
+    std::fs::write(&tunnel_known_hosts, "").unwrap();
+    let dst_3host_ok = remote_home.path().join("three_host_ok.txt");
+    let dst_3host_ok_spec = format!("dst-tofu:{}", dst_3host_ok.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            &rcpd_flag,
+            &src_spec,
+            &dst_3host_ok_spec,
+        ],
+        home.path(),
+        &env,
+    );
+    assert!(
+        out.status.success(),
+        "3-host TOFU copy failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(get_file_content(&dst_3host_ok), "tofu protected payload");
+    assert!(
+        !std::fs::read_to_string(&tunnel_known_hosts)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "3-host destination -> source tunnel must record source key in tunnel_known_hosts"
+    );
+    // keep master_known_hosts valid so master -> src and master -> dst succeed, while poisoning
+    // tunnel_known_hosts used by destination `rcpd`'s direct `-L` tunnel to source.
+    std::fs::write(
+        &tunnel_known_hosts,
+        format!("[127.0.0.1]:{} {wrong_pub}\n", sshd_src.addr.port()),
+    )
+    .unwrap();
+    let dst_3host_mitm = remote_home.path().join("three_host_mitm.txt");
+    let dst_3host_mitm_spec = format!("dst-tofu:{}", dst_3host_mitm.to_str().unwrap());
+    let out = run_rcp_with_args_home_and_env(
+        &[
+            "--remote-transport=ssh",
+            &rcpd_flag,
+            &src_spec,
+            &dst_3host_mitm_spec,
+        ],
+        home.path(),
+        &env,
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "3-host destination -> source tunnel must fail closed on changed host key:\n{combined}"
+    );
+    assert!(!dst_3host_mitm.exists());
+    assert!(
+        combined.contains("Host key verification failed")
+            || combined.contains("REMOTE HOST IDENTIFICATION HAS CHANGED"),
+        "expected host-key mismatch diagnostic on 3-host tunnel:\n{combined}"
+    );
+    drop(sshd_local);
+    drop(sshd_src);
+    drop(sshd_dst);
+}
