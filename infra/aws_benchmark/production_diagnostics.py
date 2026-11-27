@@ -97,6 +97,11 @@ MATRIX_CASE_SHAPES = dict(CASE_SHAPES, **{
     "bulk-1m-400gb": dict(directory_widths=[10, 10, 10], files_per_leaf=400, file_size_bytes=1000000),
     "tiny-1k-4096k": dict(directory_widths=[4, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
     "tiny-1k-4096k-memory": dict(directory_widths=[4, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
+    # the sets of the weekly suite that runs: the first four made five times smaller, without the 100 MB files
+    "bulk-1g-200gb": dict(directory_widths=[10], files_per_leaf=20, file_size_bytes=1000000000),
+    "bulk-1m-200gb": dict(directory_widths=[10, 10, 10], files_per_leaf=200, file_size_bytes=1000000),
+    "tiny-1k-2048k": dict(directory_widths=[2, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
+    "tiny-1k-2048k-memory": dict(directory_widths=[2, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
     "tiny-1k-700x1024": dict(directory_widths=[7, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
     "tiny-1k-10240k-memory": dict(directory_widths=[10, 10, 10, 10], files_per_leaf=1024, file_size_bytes=1000),
     "commission-64m": dict(directory_widths=[4], files_per_leaf=4, file_size_bytes=4000000),

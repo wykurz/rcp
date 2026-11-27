@@ -171,31 +171,51 @@ for _set, _scenarios in MATRIX_SCENARIO_SETS.items():
                         if case in _sets[matrix_storage(scenario)]),
             repetitions=3, timeout=3600, purpose="commissioning" if _selection == "commission" else "performance",
             runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
-# the weekly suite. Its file sets are sized from a run of every cell there was (25 November 2026)
-# so that each measured command takes one to five minutes: a shorter run varies too much and a
-# longer one says nothing more. A copy of large files takes as long as their bytes take to write,
-# so those sets hold 400 GB; everything on small files takes as long as their number, so those
-# hold 4,096,000. The tools are timed on the sets of small files only: on large files a tool is
-# done in a second or two, and per file it costs what it costs on small ones. The cells of a
-# suite never change: another choice of file sets or scenarios is the suite with the next number
+# the weekly suites. Their file sets are sized from a run of every cell there was (25 November
+# 2026). A copy of large files takes as long as their bytes take to write, and everything on small
+# files as long as their number. The tools are timed on the sets of small files only: on large
+# files a tool is done in a second or two, and per file it costs what it costs on small ones. The
+# cells of a suite never change: another choice of file sets or scenarios is the suite with the
+# next number.
+#
+# The first was sized for commands of one to five minutes: 400 GB of large files and 4,096,000
+# small ones, with every tool after the local and after the remote copies. It never ran. That run
+# also showed what a week would pay for twice. A remote copy leaves the tree that a local one
+# leaves, so rcmp and rlink after it measured the same again (89 of the 500 minutes, each 3.5%
+# slower than after the local copies). And the set of 100 MB files gave what the set of 1 GB files
+# gave (639 and 621 s, 941 and 896 s of CPU). The second has each of these once: rcmp and rlink
+# after one kind of copy of a file set, rrm after every copy, since the copy has to go and its run
+# is what removes it, and no set of 100 MB files. Its sets are a fifth of the first there were:
+# 200 GB and 2,048,000 files, for commands of a minute or two
+_WEEKLY_SUITES = {
+    "matrix-weekly-1": (
+        *((case, scenario) for case in ("bulk-1g-400gb", "bulk-100m-400gb", "bulk-1m-400gb")
+          for scenario in ("local", "remote")),
+        *(("tiny-1k-4096k", scenario) for scenario in ("local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS)),
+        *(("tiny-1k-700x1024", scenario) for scenario in ("nfs", *_NFS_TOOLS)),
+        *(("tiny-1k-4096k-memory", scenario) for scenario in ("memory", *_MEMORY_TOOLS))),
+    "matrix-weekly-2": (
+        *((case, scenario) for case in ("bulk-1g-200gb", "bulk-1m-200gb") for scenario in ("local", "remote")),
+        *(("tiny-1k-2048k", scenario) for scenario in ("local", *_LOCAL_TOOLS, "remote", "remote-rrm")),
+        *(("tiny-1k-700x1024", scenario) for scenario in ("nfs", *_NFS_TOOLS)),
+        *(("tiny-1k-2048k-memory", scenario) for scenario in ("memory", *_MEMORY_TOOLS)))}
+MATRIX_WEEKLY_SUITES = tuple(_WEEKLY_SUITES)
+# the one whose file sets the pages show once it has run
 MATRIX_WEEKLY = "matrix-weekly-1"
-_WEEKLY_CELLS = (
-    *((case, scenario) for case in ("bulk-1g-400gb", "bulk-100m-400gb", "bulk-1m-400gb")
-      for scenario in ("local", "remote")),
-    *(("tiny-1k-4096k", scenario) for scenario in ("local", *_LOCAL_TOOLS, "remote", *_REMOTE_TOOLS)),
-    *(("tiny-1k-700x1024", scenario) for scenario in ("nfs", *_NFS_TOOLS)),
-    *(("tiny-1k-4096k-memory", scenario) for scenario in ("memory", *_MEMORY_TOOLS)))
-# about four and a half hours of work are expected of it: the eight-hour allocation that the
-# copies of every file set had, with its reservation
-_base, _version = _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"], MATRIX_WEEKLY + "-plan-v1"
-_RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
-    _base, suite=MATRIX_WEEKLY, timing_basis="fixed allocation; cells that do not fit are reported as not run",
-    binary_names=(*BINARY_NAMES, *MATRIX_TOOLS),
-    plan=MappingProxyType(dict(_base["plan"], version=_version, minimum_worker_seconds=3600))))
-_MATRIX_PLAN_VERSIONS[MATRIX_WEEKLY] = _version
-_MATRIX_PROFILES[MATRIX_WEEKLY] = dict(
-    cases=tuple(dict.fromkeys(case for case, _ in _WEEKLY_CELLS)), cells=_WEEKLY_CELLS, repetitions=3, timeout=3600,
-    purpose="performance", runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
+# four and a half hours of work were expected of the first and about two are of the second: the
+# eight-hour allocation that the copies of every file set had, with its reservation. The bill
+# follows the time a run takes, not its allocation
+_base = _RECORDED_DURABLE_CONTRACTS["all-filesets-qualification-budget-v1"]
+for _suite, _cells in _WEEKLY_SUITES.items():
+    _version = _suite + "-plan-v1"
+    _RECORDED_DURABLE_CONTRACTS[_version] = MappingProxyType(dict(
+        _base, suite=_suite, timing_basis="fixed allocation; cells that do not fit are reported as not run",
+        binary_names=(*BINARY_NAMES, *MATRIX_TOOLS),
+        plan=MappingProxyType(dict(_base["plan"], version=_version, minimum_worker_seconds=3600))))
+    _MATRIX_PLAN_VERSIONS[_suite] = _version
+    _MATRIX_PROFILES[_suite] = dict(
+        cases=tuple(dict.fromkeys(case for case, _ in _cells)), cells=_cells, repetitions=3, timeout=3600,
+        purpose="performance", runner_label="aws-c5d24-ext4-raid0-matrix-v1", active=False)
 _CURRENT_PLAN_VERSIONS = MappingProxyType({
     "bulk-1g-metadata": "bulk-metadata-plan-v1",
     "bulk-100m-metadata": "bulk-100m-qualification-budget-v1",

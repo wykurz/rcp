@@ -68,10 +68,10 @@ class ToolSuiteTests(unittest.TestCase):
         manifest = matrix.run.load_manifest(ROOT / "benchmarks/matrix-cases.json")
         for suite, cells in common.MATRIX_SUITES.items():
             with self.subTest(suite=suite):
-                # a suite name says whether it times the tools; the weekly suite, named after what
+                # a suite name says whether it times the tools; a weekly suite, named after what
                 # it is for, does
                 self.assertEqual(any(scenario in matrix.TOOLS for _, scenario in cells),
-                                 "+tools" in suite or suite == common.MATRIX_WEEKLY)
+                                 "+tools" in suite or suite in common.MATRIX_WEEKLY_SUITES)
                 self.assertLessEqual({scenario for _, scenario in cells}, set(matrix.SCENARIOS))
                 # and the runner accepts its selection: every tool cell has the copy cell it follows
                 selected = matrix.selection(manifest, [case + ":" + scenario for case, scenario in cells])
@@ -83,8 +83,8 @@ class ToolSuiteTests(unittest.TestCase):
         self.assertEqual(common.DURABLE_SUITES[23:41], tuple(
             f"matrix-{selection}-{scenarios}" for scenarios in WITH_TOOLS for selection in SELECTIONS))
         # the suites with cells on other storage follow (test_storage_cells.py), and the weekly
-        # suite (test_weekly_suite.py)
-        self.assertEqual(len(common.DURABLE_SUITES), 48)
+        # suites (test_weekly_suite.py)
+        self.assertEqual(len(common.DURABLE_SUITES), 49)
         for suite in earlier:
             with self.subTest(suite=suite):
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
@@ -95,7 +95,7 @@ class ToolSuiteTests(unittest.TestCase):
     def test_a_suite_with_tools_needs_their_binaries_and_no_other_suite_does(self):
         for suite in common.DURABLE_SUITES:
             with self.subTest(suite=suite):
-                timed = "+tools" in suite or suite == common.MATRIX_WEEKLY
+                timed = "+tools" in suite or suite in common.MATRIX_WEEKLY_SUITES
                 names = ("rcp", "rcpd", "filegen", *(TOOLS if timed else ()))
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))
                 self.assertEqual(contract["binary_names"], names)
