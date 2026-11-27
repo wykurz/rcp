@@ -137,7 +137,7 @@ def format_mount(fd, number, mount, budget, execute, *, geometry=()):
     require(filesystem == "ext4", "unexpected formatted filesystem")
     mount.mkdir(parents=True, exist_ok=False)
     execute(["mount", "--no-canonicalize", "--internal-only", "-t", "ext4",
-             "-o", "nodev,nosuid", f"/proc/self/fd/{fd}", str(mount)], budget, pass_fds=(fd,))
+             "-o", "nodev,nosuid,noatime", f"/proc/self/fd/{fd}", str(mount)], budget, pass_fds=(fd,))
     require(mount.stat().st_dev == os.makedev(*map(int, number.split(":"))),
             "mounted filesystem differs from held device")
 

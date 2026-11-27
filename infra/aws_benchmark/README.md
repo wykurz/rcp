@@ -294,8 +294,11 @@ selects exactly four expected-size devices with the exact EC2 instance-store mod
 holders, changed identity and read-only devices, and pin all four devices before any format. The
 legacy layout formats the first two lexical paths; large profiles build two disjoint RAID0 arrays.
 Both use held descriptors for formatting and mounting, verify the resulting ext4 type and mounted
-device identity, and reject existing output/mount paths. EBS/root devices never qualify. Only this
-trusted supervisor has device access.
+device identity, and reject existing output/mount paths. Both mount the source and destination with
+`noatime` to suppress automatic inode access-time updates when reading the fixture. This also
+applies to the ext4 volumes exported by the loopback NFS benchmark. The setup report records the
+effective mount options. EBS/root devices never qualify. Only this trusted supervisor has device
+access.
 
 The harness and binaries run as `rcp-benchmark` in a systemd cgroup with no capabilities, no new
 privileges, private networking/devices, read-only system files, protected control groups, a 180 GiB
