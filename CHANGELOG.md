@@ -77,6 +77,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Report both `rcpd` when one of them dies during a remote copy. `rcp` used to report whichever it
   heard from first: the daemon that died, or only the other daemon's account of it. It now names
   both, source first, after giving the survivor two seconds to say what it saw.
+- Give the hint to verify `AllowTcpForwarding` whenever a copy with `--no-encryption` fails because
+  the SSH server refuses TCP forwarding. In some runs the copy failed with "data stream closed
+  before the transfer completed" alone.
 
 ### Changed
 
