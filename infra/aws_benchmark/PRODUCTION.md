@@ -1131,6 +1131,36 @@ that every page shows, and the trends of the file sets before them are kept, col
 of the page of each kind of copy and of each tool; [RESULTS.md](RESULTS.md) says how. Until then the
 pages are what they were.
 
+### The reference suite
+
+`matrix-reference-1` says what `cp` and `rsync` take for the copies of the weekly suite, without the
+one in memory. It is run by hand, once: those tools do not change from week to week, so their times
+stand beside rcp's trend and are no trend of their own. Each file set is copied by rcp first, as in
+the weekly suite, and then by each of the two, in eighteen cells:
+
+| File set           | Cells                                                        |
+| ------------------ | ------------------------------------------------------------ |
+| `tiny-1k-2048k`    | `local`, `local-cp`, `local-rsync`, `remote`, `remote-rsync` |
+| `tiny-1k-700x1024` | `nfs`, `nfs-cp`, `nfs-rsync`                                 |
+| `bulk-1m-200gb`    | `local`, `local-cp`, `local-rsync`, `remote`, `remote-rsync` |
+| `bulk-1g-200gb`    | `local`, `local-cp`, `local-rsync`, `remote`, `remote-rsync` |
+
+- **The commands.** `cp -a` and `rsync -a` of the worker image, between the two places of the copy
+  beside them. Beside the remote copies `rsync` pulls the file set over SSH; `cp` has no such copy.
+  [Reference cells](../../docs/benchmarking.md#reference-cells) says how the runner makes them.
+- **The limit.** A copy by either tool gets ten times the median of rcp's copies of the same file
+  set. One that takes longer is cut off and the tool is not tried again there: the pages say that it
+  did not finish in that time. On the network filesystem both tools are expected to end this way,
+  after about an hour each.
+- **Small files first.** There the tools differ; on large files every one of them waits for the same
+  array. Should the allocation end early, the cells that are left are the least telling.
+
+Five to seven hours of work are expected, and no worker has measured any of it. The worst case is
+longer, so the suite has the longest allocation, twelve hours with its fixed $65 reservation
+(`all-filesets-12h-v1`): cells that do not fit are reported as not run, and the bill follows the
+time a run takes. `matrix-commission-reference` has the same kinds of cell on the two small
+fixtures, to exercise such a run end to end in minutes. That is forty-six suites.
+
 ### Select a run by hand
 
 The workflow's `suite` input offers every matrix suite. The server admits one only when the policy's
@@ -1138,11 +1168,12 @@ The workflow's `suite` input offers every matrix suite. The server admits one on
 enabled by default or by a pattern. Three-hour suites use the ordinary runtime and the ordinary
 manual requesters. The `matrix-all-…` suites need what every longer run needs:
 `manual_runtime_seconds`, an unexpired `extended_manual_not_after`, and the immutable owner as
-requester. The weekly suites need the same. A plan with a runtime profile runs for exactly that
-profile's time: `manual_runtime_seconds` is `28800` for the three suites of every file set without
-the tools and for the weekly suites, and `43200` for the suites of every file set with the tools,
-and no other value is accepted. A policy holds one such value, so its `manual_suites` can name
-eight-hour suites or twelve-hour suites next to any three-hour ones, and not both.
+requester. The weekly suites and `matrix-reference-1` need the same. A plan with a runtime profile
+runs for exactly that profile's time: `manual_runtime_seconds` is `28800` for the three suites of
+every file set without the tools and for the weekly suites, and `43200` for the suites of every file
+set with the tools and for `matrix-reference-1`, and no other value is accepted. A policy holds one
+such value, so its `manual_suites` can name eight-hour suites or twelve-hour suites next to any
+three-hour ones, and not both.
 
 ### The weekly schedule
 
@@ -1347,6 +1378,17 @@ together, with `scheduled_runtime_seconds=28800` as it is today. A scheduled run
 may come in between. Its points go to the earlier trends, and the pages stay those of the weekly
 suite.
 
+The reference suites need two things of a deployment, together:
+
+- **The server packages of this revision.** Earlier packages do not know these suites.
+- **A worker image of this revision.** It has `rsync`, and its `worker.py` has a new pinned digest,
+  which gives the launch template new startup data.
+
+`matrix-reference-1` runs for twelve hours at most, so a policy that names it for a run by hand has
+`manual_runtime_seconds=43200`. A policy cannot have that next to the eight hours of a run of the
+weekly suite by hand. The policy version that schedules the weekly suite, or any after it, can name
+`matrix-reference-1` instead: a scheduled run has its own runtime.
+
 Commission one run at a time. A run holds the single active owner until its whole horizon has
 passed, not until its work is done: the capacity-search window, plus the runtime, plus fifteen
 minutes, counted from admission; collection follows. With the default twelve-hour capacity window
@@ -1400,6 +1442,16 @@ For the weekly suite, after the deployment above:
    set needs another size, which is a new file set in `matrix-weekly-3`. From this run on the pages
    show the file sets of the weekly suite.
 3. The schedule, as above, once that run is as expected.
+
+For the reference suite, after the deployment above:
+
+1. `matrix-commission-reference`: a few minutes of work. Expect the ten cells on the arrays
+   measured. On the network filesystem `cp` and `rsync` copy one file after the other, so their two
+   cells may well be cut off at ten times what rcp took: the run then shows that step too, and still
+   counts.
+2. `matrix-reference-1` by hand, once. Expect five to seven hours of work, and its page about 14 h
+   15 min after admission. From then on the page of each kind of copy shows what `cp` and `rsync`
+   took beside rcp.
 
 ### Find the evidence of a run
 

@@ -24,6 +24,10 @@ STORAGES = {kind: dict({side: "/mnt/rcp-benchmark/" + other_storage.MOUNTS[kind]
                        storage_ids=dict(other_storage.STORAGE_IDS[kind])) for kind in other_storage.MOUNTS}
 
 
+# what the cp and the rsync of an image say of themselves, as the first line of their --version
+REFERENCE_VERSIONS = dict(cp="cp (GNU coreutils) 9.4", rsync="rsync  version 3.2.7  protocol version 31")
+
+
 def matrix_record(suite, outcomes=None, **context_changes):
     """Build the document the runner writes for a suite; `outcomes` replaces cell outcomes by index."""
     contract = common.matrix_contract(suite)
@@ -41,6 +45,8 @@ def matrix_record(suite, outcomes=None, **context_changes):
         common.matrix_storage(scenario) for _, scenario in contract["cells"]) if kind != "disks"}
     if elsewhere:
         context["storages"] = elsewhere
+    if "reference_limit" in contract:
+        context["reference_limit"] = contract["reference_limit"]
     context.update(context_changes)
     # storage the run did not have: its cells were never started
     missing = {kind for kind, item in context.get("storages", {}).items() if "unavailable" in item}
@@ -52,14 +58,18 @@ def matrix_record(suite, outcomes=None, **context_changes):
         outcome = dict(status="complete", stage=None, message=None) | (outcomes or {}).get(index, {})
         # a tool cell runs its tool on the copies of the local cell; every other cell copies
         tool = matrix.TOOLS.get(scenario)
-        ran = variant if tool is None else copy.deepcopy(tool["variant"])
+        # a reference cell copies with cp or rsync, beside the copy cell of its file set before it
+        reference = matrix.REFERENCES.get(scenario)
+        ran = copy.deepcopy((tool or reference)["variant"]) if tool or reference else variant
         copies = []
         for iteration in range(1, (context["repetitions"] if outcome["status"] == "complete" else 1) + 1):
             done = outcome["status"] == "complete"
             copies.append(dict(iteration=iteration, trial_index=trial, status="ok" if done else "failed",
                 elapsed_seconds=600.0 + index + iteration / 10, exit_codes=[0] if done else [3], timed_out=False,
-                command=[ran["tool"], *ran["args"], matrix.SUMMARY_FORMAT, "source", "destination"], logs=[]))
-            if done:
+                command=[ran["tool"], *ran["args"], *(() if reference else (matrix.SUMMARY_FORMAT,)), "source",
+                         "destination"], logs=[]))
+            # neither cp nor rsync says what it used
+            if done and reference is None:
                 # only a copy that finished has a summary to take figures from
                 copies[-1]["resources"] = dict(status="complete", metrics=dict(METRICS))
                 if tool is not None:
@@ -76,6 +86,13 @@ def matrix_record(suite, outcomes=None, **context_changes):
             cell_id=matrix.cell_id(cases[case_id], scenario, ran, context), outcome=outcome, copies=copies,
             summary=dict(unit="seconds", median=statistics.median(samples), minimum=min(samples),
                          maximum=max(samples), samples=samples) if outcome["status"] == "complete" else None))
+        if reference is not None:
+            beside = next(cell for cell in cells if (cell["case_id"], cell["scenario"]) == (case_id, reference["beside"]))
+            if beside["outcome"]["status"] == "complete" and copies:
+                # what the runner gives such a cell once the cell beside it has completed
+                cells[-1]["limit_seconds"] = context["reference_limit"] * beside["summary"]["median"]
+            else:
+                cells[-1]["copies"] = []
     complete = sum(cell["outcome"]["status"] == "complete" for cell in cells)
     record = dict(schema=matrix.SCHEMA, run_id="0" * 32, timestamp="2026-11-20T08:30:00+00:00",
         status="complete" if complete == len(cells) else "partial" if complete else "failed",
@@ -84,6 +101,11 @@ def matrix_record(suite, outcomes=None, **context_changes):
                for name in ("filegen", "rcp", "rcpd", *(tool for tool in matrix.TOOL_RUNS if any(
                    matrix.TOOLS.get(scenario, {}).get("tool") == tool for _, scenario in contract["cells"])))},
         file_sets=file_sets, cells=cells, phase_seconds=dict(total=1.0))
+    # the tools of the image that the reference cells of the suite run
+    record["tools"].update({name: dict(path="/usr/bin/" + name, version=REFERENCE_VERSIONS[name], sha256="e" * 64)
+                            for name in matrix.REFERENCE_RUNS if any(
+                                matrix.REFERENCES.get(scenario, {}).get("tool") == name
+                                for _, scenario in contract["cells"])})
     return matrix.validate(record)
 
 

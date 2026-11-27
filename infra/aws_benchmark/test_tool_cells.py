@@ -82,9 +82,9 @@ class ToolSuiteTests(unittest.TestCase):
         self.assertEqual(common.DURABLE_SUITES[5:23], tuple(earlier))
         self.assertEqual(common.DURABLE_SUITES[23:41], tuple(
             f"matrix-{selection}-{scenarios}" for scenarios in WITH_TOOLS for selection in SELECTIONS))
-        # the suites with cells on other storage follow (test_storage_cells.py), and the weekly
-        # suites (test_weekly_suite.py)
-        self.assertEqual(len(common.DURABLE_SUITES), 49)
+        # the suites with cells on other storage follow (test_storage_cells.py), the weekly suites
+        # (test_weekly_suite.py) and the suites with reference cells (test_reference_cells.py)
+        self.assertEqual(len(common.DURABLE_SUITES), 51)
         for suite in earlier:
             with self.subTest(suite=suite):
                 contract = common.durable_plan_contract(common.durable_plan_for_suite(suite))

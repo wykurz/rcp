@@ -26,8 +26,14 @@ TOOLS_SCHEMA = "rcp-public-resource-diagnostics-v4"
 # filesystem or between two roots in memory is one process, as a local copy is; the tools follow
 # those copies too; and `other_storage` says what that storage was in this run
 STORAGE_SCHEMA = "rcp-public-resource-diagnostics-v5"
-# the documents in which a trial carries `roles`
-ROLE_SCHEMAS = (REMOTE_SCHEMA, TOOLS_SCHEMA, STORAGE_SCHEMA)
+# and for a matrix run with reference cells, where cp or rsync copies a file set beside rcp's copy
+# of it: such a copy names what its tool ran, as a tool run does, and has no figures, since neither
+# tool reports any. `reference_tools` says which cp and which rsync the run had. The run always
+# says of its other storage what is known, as the version before does
+REFERENCE_SCHEMA = "rcp-public-resource-diagnostics-v6"
+# the documents in which a trial carries `roles`, and those that describe the run's other storage
+ROLE_SCHEMAS = (REMOTE_SCHEMA, TOOLS_SCHEMA, STORAGE_SCHEMA, REFERENCE_SCHEMA)
+STORAGE_SCHEMAS = (STORAGE_SCHEMA, REFERENCE_SCHEMA)
 MATRIX_VARIANT = "rcp-default"
 LOCAL = "local"
 REMOTE = "remote"
@@ -41,6 +47,15 @@ TOOL_CELLS = {copies + "-" + tool: (tool, variant) for copies in (LOCAL, REMOTE)
 TOOL_VARIANTS = {scenario: variant for scenario, (_, variant) in TOOL_CELLS.items()}
 STORAGE_TOOL_CELLS = {copies + "-" + tool: (tool, variant) for copies in (LOCAL, REMOTE, *OTHER_STORAGE)
                       for tool, variant in _TOOLS}
+# the cells in which another tool copies a file set for reference, named after the copy cell each
+# stands beside: its tool, and what that tool ran. cp does not copy from a host
+REFERENCE_CELLS = {copies + "-" + tool: (tool, variant)
+                   for tool, variant, beside in (("cp", "cp-a", (LOCAL, *OTHER_STORAGE)),
+                                                 ("rsync", "rsync-a", (LOCAL, REMOTE, *OTHER_STORAGE)))
+                   for copies in beside}
+REFERENCE_TOOLS = ("cp", "rsync")
+# the longest that a tool's account of its own version may be to be shown
+MAX_TOOL_VERSION = 128
 # what a run may say of its other storage: the figures of each kind and the largest each may be
 STORAGE_FIGURES = {"nfs": (("threads", 65536), ("delay_microseconds", 10_000_000),
                            ("round_trip_microseconds", 60_000_000)),
@@ -74,6 +89,8 @@ STORAGE_PROCESS_SCOPE = TOOLS_PROCESS_SCOPE.replace(
     "A local copy is one rcp process with its threads. ",
     "A local copy, a copy between two mounts of a network filesystem and a copy between two roots in memory are "
     "each one rcp process with its threads. ")
+REFERENCE_PROCESS_SCOPE = (STORAGE_PROCESS_SCOPE +
+                           " A copy by cp or rsync has no figures: neither tool reports any about itself.")
 SYSTEM_SCOPE = ("Sampled host/cgroup diagnostics associated with phase windows, not per-process "
                 "attribution. Sampled maxima can miss peaks; cgroup lifetime peaks are not phase peaks.")
 METRICS = ("user_seconds", "system_seconds", "max_rss_kib", "voluntary_switches",
@@ -398,6 +415,8 @@ def _schema(record):
     if not _matrix(record):
         return SCHEMA
     scenarios = {cell["scenario"] for cell in record["cells"]}
+    if scenarios & set(REFERENCE_CELLS):
+        return REFERENCE_SCHEMA
     if _other_kinds(record):
         return STORAGE_SCHEMA
     if scenarios & set(TOOL_VARIANTS):
@@ -413,17 +432,23 @@ def _other_kinds(record):
 
 def _process_scope(schema):
     return {REMOTE_SCHEMA: REMOTE_PROCESS_SCOPE, TOOLS_SCHEMA: TOOLS_PROCESS_SCOPE,
-            STORAGE_SCHEMA: STORAGE_PROCESS_SCOPE}.get(schema, PROCESS_SCOPE)
+            STORAGE_SCHEMA: STORAGE_PROCESS_SCOPE, REFERENCE_SCHEMA: REFERENCE_PROCESS_SCOPE}.get(schema, PROCESS_SCOPE)
 
 
 def _tool_cells(schema):
     """The tool cells a document of this version may hold: each with its tool and what that tool ran."""
-    return {TOOLS_SCHEMA: TOOL_CELLS, STORAGE_SCHEMA: STORAGE_TOOL_CELLS}.get(schema, {})
+    return {TOOLS_SCHEMA: TOOL_CELLS, STORAGE_SCHEMA: STORAGE_TOOL_CELLS,
+            REFERENCE_SCHEMA: STORAGE_TOOL_CELLS}.get(schema, {})
+
+
+def _reference_cells(schema):
+    """The reference cells a document of this version may hold: each with its tool and what that tool ran."""
+    return REFERENCE_CELLS if schema == REFERENCE_SCHEMA else {}
 
 
 def _variant(schema, scenario):
-    """What a trial of this scenario ran: the one copy variant, or in a run with tool cells its tool's."""
-    return _tool_cells(schema).get(scenario, (None, MATRIX_VARIANT))[1]
+    """What a trial of this scenario ran: the one copy variant, or the tool's of a tool cell or a reference cell."""
+    return {**_tool_cells(schema), **_reference_cells(schema)}.get(scenario, (None, MATRIX_VARIANT))[1]
 
 
 def _daemons(schema, scenario):
@@ -431,7 +456,7 @@ def _daemons(schema, scenario):
 
     Before there were tool cells every scenario but the local one was a remote copy.
     """
-    return scenario == REMOTE if schema in (TOOLS_SCHEMA, STORAGE_SCHEMA) else scenario != LOCAL
+    return scenario == REMOTE if schema in (TOOLS_SCHEMA, *STORAGE_SCHEMAS) else scenario != LOCAL
 
 
 def _storage_entry(kind, item):
@@ -472,9 +497,26 @@ def _other_storage(record, worker):
 
 
 def _complete(trials):
-    """Whether every copy has every figure it could have: its command's and, if remote, each daemon's."""
+    """Whether every copy has every figure it could have: its command's and, if remote, each daemon's.
+
+    A copy by cp or rsync could have none: it is not one that lacks them.
+    """
     return all(trial["metrics"] is not None and
-               all(value is not None for value in (trial.get("roles") or {}).values()) for trial in trials)
+               all(value is not None for value in (trial.get("roles") or {}).values())
+               for trial in trials if trial.get("scenario") not in REFERENCE_CELLS)
+
+
+def _tool_version(value):
+    """What a tool said of its version, when that is short plain text that a page can show; None otherwise."""
+    return value if isinstance(value, str) and 0 < len(value) <= MAX_TOOL_VERSION and \
+        all(" " <= character <= "~" for character in value) else None
+
+
+def _reference_tools(raw):
+    """The cp and the rsync of a run, as each named its version to the runner."""
+    recorded = _mapping(_mapping(raw).get("tools"))
+    versions = {name: _tool_version(_mapping(recorded.get(name)).get("version")) for name in REFERENCE_TOOLS}
+    return {name: version for name, version in versions.items() if version is not None}
 
 
 def unavailable(record, reason="not_recorded"):
@@ -484,9 +526,11 @@ def unavailable(record, reason="not_recorded"):
         archive_sha256=None, status="unavailable", reason=reason, process_scope=_process_scope(_schema(record)),
         system_scope=SYSTEM_SCOPE, setup=None, setup_id=None, trials=[], cases=[], system=None,
         limits=dict(allocation_seconds=None, command_timeout_seconds=None))
-    if value["schema"] == STORAGE_SCHEMA:
+    if value["schema"] in STORAGE_SCHEMAS:
         # the document of such a run always says of each storage what is known: here, nothing
         value["other_storage"] = {kind: dict(status="not_recorded") for kind in _other_kinds(record)}
+    if value["schema"] == REFERENCE_SCHEMA:
+        value["reference_tools"] = {}
     return validate(value, record)
 
 
@@ -604,7 +648,8 @@ def _derive_matrix(record, archive, raw, worker):
             def figures(recorded):
                 return _resources(dict(status=item["status"], ok=done,
                                        resources=recorded if isinstance(recorded, dict) else {}))
-            resource = figures(item.get("resources"))
+            # a copy by cp or rsync has no figures, whatever its record holds
+            resource = None if cell["scenario"] in _reference_cells(schema) else figures(item.get("resources"))
             if done:
                 grouped.setdefault((cell["case_id"], cell["scenario"]), []).append(item["elapsed_seconds"])
             system = _system(item.get("system_telemetry") if sampled else None)
@@ -659,8 +704,10 @@ def _assemble(record, archive, raw, worker, selected, cases, sampled):
         system_scope=SYSTEM_SCOPE,
         setup=observed, setup_id=setup_id(observed), trials=selected, cases=cases,
         system=_system(raw.get("system_telemetry") if sampled else None), limits=limits)
-    if value["schema"] == STORAGE_SCHEMA:
+    if value["schema"] in STORAGE_SCHEMAS:
         value["other_storage"] = _other_storage(record, worker)
+    if value["schema"] == REFERENCE_SCHEMA:
+        value["reference_tools"] = _reference_tools(raw)
     if len(encoded(value)) > MAX_DOCUMENT:
         # Sampled detail is optional; it must not erase already recorded process metrics/setup.
         value["reason"] = "phase_summary_budget"
@@ -677,13 +724,19 @@ def validate(value, record):
     shapes = MATRIX_CASE_SHAPES if matrix else CASE_SHAPES
     require(isinstance(value, dict) and set(value) == {"schema", "run_key", "retirement_sha256",
         "archive_sha256", "status", "reason", "process_scope", "system_scope", "setup", "setup_id", "trials", "cases",
-        "system", "limits", *(("other_storage",) if schema == STORAGE_SCHEMA else ())} and
+        "system", "limits", *(("other_storage",) if schema in STORAGE_SCHEMAS else ()),
+        *(("reference_tools",) if schema == REFERENCE_SCHEMA else ())} and
         value["schema"] == _schema(record) and value["run_key"] == record["run_key"] and
         value["retirement_sha256"] == record["retirement_sha256"] and value["status"] in STATUSES and
         value["process_scope"] == _process_scope(value["schema"]) and value["system_scope"] == SYSTEM_SCOPE,
         "invalid public diagnostic identity")
     require(value["reason"] is None or value["reason"] in REASONS, "invalid diagnostic reason")
-    if schema == STORAGE_SCHEMA:
+    if schema == REFERENCE_SCHEMA:
+        # each tool that named its version, as short plain text
+        tools = value["reference_tools"]
+        require(isinstance(tools, dict) and set(tools) <= set(REFERENCE_TOOLS) and
+                all(_tool_version(text) == text for text in tools.values()), "invalid public reference tools")
+    if schema in STORAGE_SCHEMAS:
         # one entry for each storage beside the arrays that the run has cells on, and no other
         other = value["other_storage"]
         require(isinstance(other, dict) and set(other) == set(_other_kinds(record)) and
@@ -744,12 +797,14 @@ def validate(value, record):
         if "nfs_rpc" in trial:
             window = trial["nfs_rpc"]
             links = _mapping(window).get("hard_links_created")
-            require(schema == STORAGE_SCHEMA and trial["scenario"] == "nfs-rlink" and value["setup"] is not None and
+            require(schema in STORAGE_SCHEMAS and trial["scenario"] == "nfs-rlink" and value["setup"] is not None and
                     value["setup"]["instrumentation"] is not None and (links is None or
                         _link_count(links, trial["case_id"]) is not None) and _nfs_window(window, links) == window,
                     "invalid public NFS RPC diagnostics")
         metrics = trial["metrics"]
         require((metrics is None) == (trial["status"] == "unavailable"), "invalid resource availability")
+        require(metrics is None or trial.get("scenario") not in _reference_cells(schema),
+                "a copy by cp or rsync has no figures")
         if metrics is not None:
             require(isinstance(metrics, dict) and set(metrics) == set(METRICS) and
                 all(number(metrics[key], integer=key not in {"user_seconds", "system_seconds"}) for key in METRICS),
@@ -1135,7 +1190,8 @@ def time_use(value, record):
     None for a run that marked no phase. A run is not `complete` when a command of it recorded none,
     or the steps outside its commands did not: it took longer than its total.
     """
-    tool_cells = _tool_cells(value["schema"])
+    # a copy by cp or rsync is counted under its tool, as a run of one of the other tools is
+    tool_cells = {**_tool_cells(value["schema"]), **_reference_cells(value["schema"])}
     order = [case["case_id"] for case in value["cases"]]
     commands, around, cases = {}, {}, {}
 
@@ -1313,6 +1369,7 @@ def render(value, record):
     # the tool cells of this document, and with them whether it has any
     tool_cells = _tool_cells(value["schema"])
     tools = bool(tool_cells)
+    reference_cells = _reference_cells(value["schema"])
     text = ("<section aria-labelledby='resource-diagnostics'><h2 id='resource-diagnostics'>Resource diagnostics</h2>"
         "<p>Supplementary diagnostics derived from the exact retirement-bound worker archive. The "
         "canonical qualification record, verdict and measurement series are unchanged.</p>"
@@ -1325,13 +1382,17 @@ def render(value, record):
     rows = []
     for trial in value["trials"]:
         # one row for each measured process: the copy command or the tool and, for a remote copy, each daemon
-        command = tool_cells[trial["scenario"]][0] if trial.get("scenario") in tool_cells else "rcp"
+        reference = trial.get("scenario") in reference_cells
+        command = {**tool_cells, **reference_cells}.get(trial.get("scenario"), ("rcp",))[0]
         processes = [(command, trial["metrics"])] if with_roles else [(None, trial["metrics"])]
         if with_roles and trial["roles"] is not None:
             processes += [(role + " rcpd", trial["roles"][role]) for role in ROLES]
         for process, metrics in processes:
             fields = [str(trial["iteration"])] + ([] if process is None else [process])
-            if metrics is None:
+            if reference:
+                # nothing is missing: cp and rsync report nothing about themselves
+                fields += ["not reported"] + ["—"] * len(METRICS)
+            elif metrics is None:
                 fields += ["unavailable"] * (len(METRICS) + 1)
             else:
                 fields += ["complete", f'{metrics["user_seconds"]:.3f}', f'{metrics["system_seconds"]:.3f}']
@@ -1349,7 +1410,11 @@ def render(value, record):
             "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
     else:
         text += "<p>No per-copy process-resource measurements are available.</p>"
-    if value["schema"] == STORAGE_SCHEMA:
+    if value["schema"] == REFERENCE_SCHEMA and value["reference_tools"]:
+        text += ("<p>The reference copies of this run were made by " + " and ".join(
+            "<code>" + escape(value["reference_tools"][name]) + "</code>" for name in REFERENCE_TOOLS
+            if name in value["reference_tools"]) + ".</p>")
+    if value["schema"] in STORAGE_SCHEMAS:
         text += _other_storage_html(value["other_storage"]) + _nfs_rpc_html(value["trials"])
     if value["cases"]:
         progress_rows = []

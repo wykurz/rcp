@@ -123,7 +123,7 @@ class StorageSuiteTests(unittest.TestCase):
 
     def test_earlier_suites_and_every_recorded_plan_are_what_they_were(self):
         # a plan version is a promise to every run recorded under it
-        later = (*ADDED, *common.MATRIX_WEEKLY_SUITES)
+        later = (*ADDED, *common.MATRIX_WEEKLY_SUITES, *common.MATRIX_REFERENCE_SUITES)
         earlier = {version: contract for version, contract in common._RECORDED_DURABLE_CONTRACTS.items()
                    if not any(version.startswith(suite + "-plan-") for suite in later)}
         self.assertEqual(len(earlier), 44)
@@ -331,10 +331,12 @@ class StorageRecordTests(unittest.TestCase):
     def test_a_suite_with_cells_on_other_storage_has_a_record_version_of_its_own(self):
         for suite, cells in common.MATRIX_SUITES.items():
             with self.subTest(suite=suite):
-                expected = (V6 if suite in (*ADDED, *common.MATRIX_WEEKLY_SUITES) else
+                # a suite with reference cells has the version after these (test_reference_cells.py)
+                expected = ("rcp-production-public-report-v7" if suite in common.MATRIX_REFERENCE_SUITES else
+                            V6 if suite in (*ADDED, *common.MATRIX_WEEKLY_SUITES) else
                             V5 if "+tools" in suite else V4)
                 self.assertEqual(projection.matrix_schema(scenario for _, scenario in cells), expected)
-        self.assertEqual(projection.MATRIX_SCHEMAS, (V4, V5, V6))
+        self.assertEqual(projection.MATRIX_SCHEMAS[:3], (V4, V5, V6))
 
     def test_the_published_variants_are_the_ones_the_runner_runs(self):
         self.assertEqual(projection.PUBLIC_CONTRACTS[V6]["tool_variants"],

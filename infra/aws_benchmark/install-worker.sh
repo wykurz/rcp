@@ -37,7 +37,11 @@ systemctl mask "${nfs_units[@]}"
 apt-get update
 # openssh: remote benchmark cells run their own unprivileged sshd on a private loopback.
 # nfs-kernel-server, iproute2, kmod: the server, the delay and the kernel modules of those cells
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm libsystemd0 systemd openssh-client openssh-server nfs-kernel-server iproute2 kmod
+# rsync: reference cells copy a file set with it and with cp, which the base system has
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 python3-venv time e2fsprogs util-linux mdadm libsystemd0 systemd openssh-client openssh-server nfs-kernel-server iproute2 kmod rsync
+# the worker names these two by path for reference cells (worker.py, REFERENCE_TOOLS)
+test -x /usr/bin/cp
+test -x /usr/bin/rsync
 # avoid background monitoring/check wakeups; leave md assembly and udev intact
 for unit in mdcheck_start.timer mdcheck_continue.timer mdmonitor-oneshot.timer \
     mdcheck_start.service mdcheck_continue.service mdmonitor.service mdmonitor-oneshot.service; do

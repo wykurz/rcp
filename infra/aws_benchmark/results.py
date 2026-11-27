@@ -368,6 +368,8 @@ def validate_qualification(evidence, result, policy, *, producer_role="execution
                 and context["runner_label"] == contract["runner_label"]
                 and context["repetitions"] == contract["repetitions"]
                 and context["timeout_seconds"] == contract["timeout"]
+                # what a reference copy was given is the suite's to say, and no other suite gives one
+                and context.get("reference_limit") == contract.get("reference_limit")
                 and [(cell["case_id"], cell["scenario"]) for cell in result["cells"]] == list(contract["cells"]),
                 "unexpected matrix measurement contract")
         # one build is measured; the request's baseline copies of the same bytes are not run. Every

@@ -170,6 +170,8 @@ def cache_server(budget, uid, history=None):
 
 # what the image provides for remote matrix cells, which run a private sshd on loopback
 OPENSSH = ("--sshd", "/usr/sbin/sshd", "--ssh", "/usr/bin/ssh", "--ssh-keygen", "/usr/bin/ssh-keygen")
+# and for reference cells, which copy with the cp and the rsync of the image
+REFERENCE_TOOLS = ("--cp", "/usr/bin/cp", "--rsync", "/usr/bin/rsync")
 ENVIRONMENT = ("--setenv=PATH=/opt/rcp-benchmark/bin:/usr/bin:/bin", "--setenv=PYTHONPATH=" + str(ROOT),
                "--setenv=LC_ALL=C", "--setenv=LANG=C")
 
@@ -264,6 +266,9 @@ def command(window, seconds, other=None):
                  "--runner-label", contract["runner_label"], *storage]
         if loopback:
             argv += OPENSSH
+        if "reference_limit" in contract:
+            # the limit is the suite's, not the runner's default of the day
+            argv += [*REFERENCE_TOOLS, "--reference-limit", str(contract["reference_limit"])]
         # the storage beside the arrays that this suite measures on: where the supervisor put it,
         # or why there is none. Either way the cells there keep the names that identify them
         for kind in dict.fromkeys(matrix_storage(scenario) for _, scenario in contract["cells"]):
