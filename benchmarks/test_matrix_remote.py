@@ -155,13 +155,24 @@ class RemoteCellTests(unittest.TestCase):
             yield made
 
     def assert_stopped(self, pids):
+        def running(pid):
+            # Exited processes have no proc entry; zombies have an empty command line.
+            try:
+                return bool(Path(f"/proc/{pid}/cmdline").read_bytes())
+            except FileNotFoundError:
+                return False
+
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and any(Path(f"/proc/{pid}/cmdline").exists() and
-                                                  Path(f"/proc/{pid}/cmdline").read_bytes() for pid in pids):
+        while time.monotonic() < deadline and any(running(pid) for pid in pids):
             time.sleep(.05)
         for pid in pids:
-            # a process that has ended is gone or a zombie, whose command line reads empty
-            self.assertFalse(Path(f"/proc/{pid}/cmdline").exists() and Path(f"/proc/{pid}/cmdline").read_bytes(), pid)
+            self.assertFalse(running(pid), pid)
+
+    def test_assert_stopped_accepts_a_process_that_disappears_between_checks(self):
+        # Even if a preceding existence check sees the process, it can disappear before open.
+        with (mock.patch.object(Path, "exists", return_value=True),
+              mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError)):
+            self.assert_stopped([123])
 
     def test_a_remote_cell_copies_over_loopback_and_records_what_each_process_reports(self):
         with self.endpoint_directories() as made:
