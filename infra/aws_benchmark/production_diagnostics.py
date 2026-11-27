@@ -919,30 +919,30 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
         f"each limited to {configured['memory_bytes'] >> 30} GiB, where no operation waits for a disk.</li>")
     more_sets = ("" if not elsewhere else
         "<tr><td>1 KB on NFS</td><td>716,800</td><td>1,000</td><td>716.8 MB</td></tr>" + (
-            "<tr><td>1 KB in memory</td><td>4,096,000</td><td>1,000</td><td>4.096 GB</td></tr>" if sized else
+            "<tr><td>1 KB in memory</td><td>2,048,000</td><td>1,000</td><td>2.048 GB</td></tr>" if sized else
             "<tr><td>1 KB in memory</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>"))
     # the file sets of the arrays: those of the weekly suite, or the ones before them
-    sets = ("<tr><td>1 GB</td><td>400</td><td>1,000,000,000</td><td>400 GB</td></tr>"
-            "<tr><td>100 MB</td><td>4,000</td><td>100,000,000</td><td>400 GB</td></tr>"
-            "<tr><td>1 MB</td><td>400,000</td><td>1,000,000</td><td>400 GB</td></tr>"
-            "<tr><td>1 KB</td><td>4,096,000</td><td>1,000</td><td>4.096 GB</td></tr>" if sized else
+    sets = ("<tr><td>1 GB</td><td>200</td><td>1,000,000,000</td><td>200 GB</td></tr>"
+            "<tr><td>1 MB</td><td>200,000</td><td>1,000,000</td><td>200 GB</td></tr>"
+            "<tr><td>1 KB</td><td>2,048,000</td><td>1,000</td><td>2.048 GB</td></tr>" if sized else
             "<tr><td>1 GB</td><td>1,000</td><td>1,000,000,000</td><td>1 TB</td></tr>"
             "<tr><td>100 MB</td><td>10,240</td><td>100,000,000</td><td>1.024 TB</td></tr>"
             "<tr><td>1 MB</td><td>1,024,000</td><td>1,000,000</td><td>1.024 TB</td></tr>"
             "<tr><td>1 KB</td><td>10,240,000</td><td>1,000</td><td>10.24 GB</td></tr>")
     sets_note = (
-        "The sets are sized so that a copy, and a run of a tool where one is timed, takes one to five minutes "
-        "on this machine. Until the weekly suite replaced them, the sets were two and a half times larger (a "
-        "terabyte of large files, and 10,240,000 files of 1 KB): the trends of those sets are under “Earlier "
-        "file sets” on the page of each kind of copy and of each tool." if sized else
+        "The sets are sized so that a copy, and a run of a tool where one is timed, takes a minute or two on "
+        "this machine. Until the weekly suite replaced them, the sets were five times larger (a terabyte of large "
+        "files, and 10,240,000 files of 1 KB), and one more held files of 100 MB: the trends of those sets are "
+        "under “Earlier file sets” on the page of each kind of copy and of each tool." if sized else
         "The 1 KB file set has exactly 100 times less total logical data than the 1.024 TB sets; it still "
         "exercises over ten million files.")
     bound = (
-        "The 1 GB, 100 MB and 1 MB file sets hold 400 GB each, about twice the machine's memory, so a copy of "
-        "them cannot go faster than the destination array takes writes. " if sized else
+        "The 1 GB and 1 MB file sets hold 200 GB each, about as much as the machine has memory. The kernel lets "
+        "a copy run ahead of the disks by a part of that memory only, so most of such a copy goes at the pace at "
+        "which the destination array takes writes. " if sized else
         "The 1 GB, 100 MB and 1 MB file sets hold about a terabyte each, several times the machine's memory, "
         "so a copy of them cannot go faster than the destination array takes writes. ")
-    unbound = ("The 1 KB file set holds about 4 GB, which fits in memory many times over, and is not bound this "
+    unbound = ("The 1 KB file set holds about 2 GB, which fits in memory many times over, and is not bound this "
                "way." if sized else
                "The 1 KB file set holds about 10 GB, which fits in memory many times over, and is not bound this "
                "way.")
@@ -951,7 +951,10 @@ def configuration_html(observations, *, remote=False, tools=False, elsewhere=Fal
              "A matrix run can also time the other tools on each local copy, and on each remote copy when its "
              "suite says so, in this order: ")
     untimed = (" A tool takes as long as its files are many, and the sets of larger files have too few of them "
-               "for a run of a minute, so no tool is timed there." if sized else "")
+               "for a run of a minute, so no tool is timed there. On the arrays <code>rcmp</code> and "
+               "<code>rlink</code> follow the local copies only: a remote copy leaves the same tree, and comparing "
+               "it or hard-linking it once more would measure the same again. <code>rrm</code> follows every copy, "
+               "since its run is what removes it." if sized else "")
     more_sets_note = ("" if not elsewhere else
         " The file set on NFS is 700 directories of 1,024 files: a network filesystem takes one new file at a "
         "time in a directory, so many small directories are what a parallel tool can work on there.")

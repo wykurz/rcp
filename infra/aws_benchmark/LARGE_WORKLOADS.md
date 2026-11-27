@@ -419,13 +419,15 @@ qualification and rollout.
 - **Commissioning fixtures.** The `matrix-commission-…` suites use `commission-64m` (16 files of 4
   MB) and `commission-10k` (10,000 files of 1 KB in 100 directories). They exist to exercise every
   step in seconds and are not performance evidence.
-- **Weekly suite.** `matrix-weekly-1` is the one suite that is not every file set of a selection
-  under every scenario of a set. Its file sets are sized so that a measured command takes one to
-  five minutes: 400 GB of 1 GB, of 100 MB and of 1 MB files (`bulk-1g-400gb`, `bulk-100m-400gb`,
-  `bulk-1m-400gb`), and 4,096,000 files of 1 KB on the arrays and in memory (`tiny-1k-4096k`,
-  `tiny-1k-4096k-memory`), with the file set on NFS as it is. Only the sets of 1 KB files have tool
-  cells. It runs as any suite with the tools and with cells on other storage does, in the eight-hour
-  allocation. [The weekly suite](PRODUCTION.md#the-weekly-suite) says how it was sized.
+- **Weekly suites.** `matrix-weekly-2` is not every file set of a selection under every scenario of
+  a set. Its file sets are sized so that a measured command takes a minute or two: 200 GB of 1 GB
+  and of 1 MB files (`bulk-1g-200gb`, `bulk-1m-200gb`), and 2,048,000 files of 1 KB on the arrays
+  and in memory (`tiny-1k-2048k`, `tiny-1k-2048k-memory`), with the file set on NFS as it is. Only
+  the sets of 1 KB files have tool cells, and on the arrays `rcmp` and `rlink` follow the local
+  copies only. It runs as any suite with the tools and with cells on other storage does, in the
+  eight-hour allocation. `matrix-weekly-1`, defined before it with sets twice as large (`…-400gb`,
+  `tiny-1k-4096k`) and every tool after every copy, never ran and stays as it was recorded.
+  [The weekly suite](PRODUCTION.md#the-weekly-suite) says how both were sized.
 
 - **Remote cells.** A suite whose name has `remote` runs
   `rcp --force-remote --bind-ip=127.0.0.1 … 127.0.0.1:SOURCE 127.0.0.1:DESTINATION` for those cells.
