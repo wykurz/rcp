@@ -254,7 +254,7 @@ impl AcceptingSendStreamPool {
         data_listener: tokio::net::TcpListener,
         pool_size: usize,
         tcp_config: &remote::TcpConfig,
-        tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+        stream_acceptor: remote::tls::StreamAcceptor,
         shutdown_token: PoolShutdownToken,
         fatal: Arc<discovery::Fatal>,
         tasks: &mut tokio::task::JoinSet<anyhow::Result<()>>,
@@ -285,15 +285,19 @@ impl AcceptingSendStreamPool {
                                 match result {
                                     Ok((stream, addr)) => {
                                         tracing::debug!("Accepted data connection from {}", addr);
-                                        // Wrap with TLS if configured. This handshake runs INLINE in
-                                        // the accept loop, so its bound is what stops one stalled
-                                        // peer from blocking every further data connection. Only the
-                                        // write half is kept (the destination never sends here), and
-                                        // a failure drops just this connection.
+                                        // authenticate the data connection under the resolved
+                                        // stream acceptor (TLS or SSH loopback HMAC-SHA256, or
+                                        // plaintext with `--no-encryption`). This handshake runs
+                                        // INLINE in the accept loop, so its bound is what stops
+                                        // one stalled peer from blocking every further data
+                                        // connection. Only the write half is kept (the destination
+                                        // never sends here), and a failure drops just this
+                                        // connection.
                                         let send_stream = match remote::tls::accept_bounded(
-                                            tls_acceptor.as_deref(),
+                                            &stream_acceptor,
                                             stream,
                                             accept_tls_timeout,
+                                            remote::tls::StreamKind::Data,
                                             "data",
                                         ).await {
                                             Ok((send_stream, _recv_stream)) => send_stream
@@ -412,7 +416,7 @@ async fn handle_connection(
     admission: common::EndpointAdmission,
     files_source: common::FilesInFlightSource,
     error_collector: std::sync::Arc<common::error_collector::ErrorCollector>,
-    tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    control_acceptor: &remote::tls::ControlStreamAcceptor,
     peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<()> {
     tracing::info!("Destination control connection established");
@@ -420,16 +424,22 @@ async fn handle_connection(
     let max_pending_files = concurrency.max_pending_files().get();
     // the control stream's socket options (no-delay, buffers, liveness) were applied by the caller
     // when it accepted the connection
-    // wrap control connection with TLS if configured; the handshake is bounded because a peer that
-    // establishes TCP then stalls it would otherwise hang the source here indefinitely, before any
-    // teardown state exists
-    let (control_send_stream, mut control_recv_stream) = remote::tls::accept_bounded(
-        tls_acceptor.as_deref(),
-        control_stream,
-        std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
-        "control",
-    )
-    .await?;
+    // authenticate control connection (mTLS, SSH loopback HMAC-SHA256, or auto-dispatched); the
+    // handshake is bounded because a peer that establishes TCP then stalls would otherwise hang
+    // the source here indefinitely, before any teardown state exists. Resolving `Auto` here locks
+    // the concrete `data_acceptor` mode for every subsequent data connection.
+    let (control_send_stream, mut control_recv_stream, data_acceptor) =
+        remote::tls::accept_control_bounded(
+            control_acceptor,
+            control_stream,
+            std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
+            "control",
+        )
+        .await?;
+    tracing::info!(
+        "Source control stream authenticated ({})",
+        data_acceptor.description()
+    );
     peer_connected.store(true, std::sync::atomic::Ordering::Release);
     let receiver_limits = tokio::time::timeout(
         std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
@@ -449,7 +459,7 @@ async fn handle_connection(
         data_listener,
         pool_size,
         tcp_config,
-        tls_acceptor,
+        data_acceptor,
         pool_shutdown.clone(),
         fatal.clone(),
         &mut accept_tasks,
@@ -1171,20 +1181,25 @@ async fn handle_dry_run_connection(
     src: &std::path::Path,
     dst: &std::path::Path,
     dry_run_mode: common::config::DryRunMode,
-    tls_acceptor: Option<std::sync::Arc<tokio_rustls::TlsAcceptor>>,
+    control_acceptor: &remote::tls::ControlStreamAcceptor,
     conn_timeout_sec: u64,
     peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     tracing::info!("Handling dry-run connection");
-    // set up TLS if needed; the handshake is bounded like every other (a peer that establishes TCP
-    // then stalls would otherwise hang this connection indefinitely)
-    let (control_send_stream, mut control_recv_stream) = remote::tls::accept_bounded(
-        tls_acceptor.as_deref(),
-        stream,
-        std::time::Duration::from_secs(conn_timeout_sec),
-        "dry-run control",
-    )
-    .await?;
+    // authenticate control stream; the handshake is bounded like every other (a peer that
+    // establishes TCP then stalls would otherwise hang this connection indefinitely)
+    let (control_send_stream, mut control_recv_stream, resolved) =
+        remote::tls::accept_control_bounded(
+            control_acceptor,
+            stream,
+            std::time::Duration::from_secs(conn_timeout_sec),
+            "dry-run control",
+        )
+        .await?;
+    tracing::info!(
+        "Source dry-run control stream authenticated ({})",
+        resolved.description()
+    );
     peer_connected.store(true, std::sync::atomic::Ordering::Release);
     let control_send_stream: remote::streams::BoxedSharedSendStream =
         std::sync::Arc::new(tokio::sync::Mutex::new(control_send_stream));
@@ -1370,34 +1385,11 @@ pub async fn run_source(
     bind_ip: Option<&str>,
     accept_timeout: std::time::Duration,
     cert_key: Option<&remote::tls::CertifiedKey>,
-    dest_cert_fingerprint: Option<remote::protocol::CertFingerprint>,
+    peer_auth: &remote::protocol::PeerAuth,
     peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
-    // create TLS acceptor if encryption is enabled (requires both cert and dest fingerprint)
-    let tls_acceptor = match (cert_key, dest_cert_fingerprint) {
-        (Some(cert), Some(dest_fp)) => {
-            // create server config with client certificate verification
-            let server_config = remote::tls::create_server_config_with_client_auth(cert, dest_fp)
-                .context("failed to create TLS server config with client auth")?;
-            Some(std::sync::Arc::new(tokio_rustls::TlsAcceptor::from(
-                server_config,
-            )))
-        }
-        (None, None) => None,
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!(
-                "TLS configuration mismatch: source certificate and destination fingerprint must both be present or both absent"
-            );
-        }
-    };
-    tracing::info!(
-        "Source TLS encryption: {}",
-        if tls_acceptor.is_some() {
-            "enabled (mutual TLS)"
-        } else {
-            "disabled"
-        }
-    );
+    let control_acceptor = remote::tls::ControlStreamAcceptor::from_peer_auth(cert_key, peer_auth)?;
+    tracing::info!("Source stream security: {}", control_acceptor.description());
     // create TCP listeners for control and data connections
     let control_listener = remote::create_tcp_control_listener(tcp_config, bind_ip).await?;
     let data_listener = remote::create_tcp_data_listener(tcp_config, bind_ip).await?;
@@ -1442,7 +1434,7 @@ pub async fn run_source(
                     src,
                     dst,
                     dry_run_mode,
-                    tls_acceptor,
+                    &control_acceptor,
                     tcp_config.conn_timeout_sec,
                     peer_connected,
                 )
@@ -1461,7 +1453,7 @@ pub async fn run_source(
                 admission,
                 files_source,
                 error_collector.clone(),
-                tls_acceptor,
+                &control_acceptor,
                 peer_connected,
             )
             .await?;

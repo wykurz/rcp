@@ -53,7 +53,10 @@ pub struct ProtocolVersion {
 /// `RcpdResult::Failure::peer_connected`, `MasterHello::Source::accept_timeout_sec`,
 /// `MasterHello::Destination::source_data_addrs`, and destination `--ssh-tunnels` descriptor
 /// accounting).
-pub const WIRE_REVISION: u32 = 14;
+/// Revision 15 replaces bare optional TLS fingerprints in `MasterHello` with `PeerAuth`
+/// (`Tls`, `SshSharedSecret`, `AutoTlsOrSshSecret`, `None`) so SSH-tunneled streams authenticate
+/// via 1-RTT loopback mutual HMAC-SHA256 instead of double-encrypting with TLS.
+pub const WIRE_REVISION: u32 = 15;
 
 impl ProtocolVersion {
     /// Get the current protocol version

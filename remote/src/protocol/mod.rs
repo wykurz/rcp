@@ -974,13 +974,78 @@ pub enum RcpdToMaster {
     Tracing(common::remote_tracing::TracingMessage),
 }
 
+/// Per-session 256-bit shared secret used for 1-RTT mutual HMAC-SHA256 authentication on
+/// SSH-forwarded loopback TCP streams (preventing unauthorized local connections without adding a
+/// second bulk encryption layer inside SSH).
+///
+/// Redacts its bytes in [`std::fmt::Debug`] so logging [`MasterHello`] never exposes key material.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct SshAuthSecret([u8; 32]);
+
+impl SshAuthSecret {
+    /// Generate a fresh random 256-bit session secret.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(rand::random())
+    }
+
+    /// Construct a secret from fixed bytes (primarily for deterministic wire/unit tests).
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Return the raw 32-byte key material.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SshAuthSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SshAuthSecret([REDACTED])")
+    }
+}
+
+/// Source↔Destination stream authentication and encryption policy carried inside [`MasterHello`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum PeerAuth {
+    /// Direct TCP with mutual TLS 1.3 and SHA-256 certificate fingerprint pinning.
+    Tls { peer_fingerprint: CertFingerprint },
+    /// Loopback-only 1-RTT mutual HMAC-SHA256 handshake over SSH-forwarded TCP (no bulk TLS).
+    SshSharedSecret { secret: SshAuthSecret },
+    /// Automatic transport: mutual TLS 1.3 on direct TCP, or loopback-only mutual HMAC-SHA256 on
+    /// SSH fallback (never allowed from non-loopback peers).
+    AutoTlsOrSshSecret {
+        peer_fingerprint: CertFingerprint,
+        secret: SshAuthSecret,
+    },
+    /// Explicit `--no-encryption` opt-out (plaintext TCP with no peer authentication).
+    None,
+}
+
+impl PeerAuth {
+    /// Validate that the daemon's local TLS certificate presence matches this policy.
+    pub fn validate_cert_presence(&self, has_cert: bool) -> anyhow::Result<()> {
+        let expects_cert = matches!(self, Self::Tls { .. } | Self::AutoTlsOrSshSecret { .. });
+        if has_cert != expects_cert {
+            anyhow::bail!(
+                "stream security configuration mismatch: TLS certificate presence ({has_cert}) does not match peer authentication policy ({self:?})"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum MasterHello {
     Source {
         src: std::path::PathBuf,
         dst: std::path::PathBuf,
-        /// Destination's TLS certificate fingerprint (None if encryption disabled)
-        dest_cert_fingerprint: Option<CertFingerprint>,
+        /// Source↔Destination authentication and encryption policy.
+        peer_auth: PeerAuth,
         /// Filter settings for include/exclude patterns (source-side filtering)
         filter: Option<common::filter::FilterSettings>,
         /// Dry-run mode for previewing operations
@@ -1002,8 +1067,8 @@ pub enum MasterHello {
         source_data_addrs: Vec<std::net::SocketAddr>,
         server_name: String,
         preserve: common::preserve::Settings,
-        /// Source's TLS certificate fingerprint (None if encryption disabled)
-        source_cert_fingerprint: Option<CertFingerprint>,
+        /// Source↔Destination authentication and encryption policy.
+        peer_auth: PeerAuth,
         /// Preview-only operation; the source does not accept data connections.
         dry_run: bool,
         /// Transport and fallback strategy for reaching the source daemon.
@@ -1044,10 +1109,11 @@ pub enum RcpdResult {
         error: String,
         summary: common::copy::Summary,
         runtime_stats: common::RuntimeStats,
-        /// True when the source↔destination control session had already been established (including
-        /// TLS authentication when enabled) before this failure occurred. When true, the peer may
-        /// hold partial copy/skip counts and the master waits for its terminal result rather than
-        /// cancelling it after the pre-connection peer-failure grace timer.
+        /// True when the source↔destination control session had already been established
+        /// (including mutual TLS or SSH loopback HMAC authentication when enabled) before this
+        /// failure occurred. When true, the peer may hold partial copy/skip counts and the master
+        /// waits for its terminal result rather than cancelling it after the pre-connection
+        /// peer-failure grace timer.
         peer_connected: bool,
     },
 }
@@ -1722,5 +1788,30 @@ mod tests {
         };
         assert!(!empty.matches(&empty));
         assert!(!base.matches(&empty));
+    }
+
+    #[test]
+    fn ssh_auth_secret_redacts_debug_output() {
+        let secret = SshAuthSecret::from_bytes([0xab; 32]);
+        assert_eq!(format!("{secret:?}"), "SshAuthSecret([REDACTED])");
+        for auth in [
+            PeerAuth::SshSharedSecret {
+                secret: secret.clone(),
+            },
+            PeerAuth::AutoTlsOrSshSecret {
+                peer_fingerprint: [0x11; 32],
+                secret,
+            },
+        ] {
+            let rendered = format!("{auth:?}");
+            assert!(
+                rendered.contains("REDACTED"),
+                "expected redaction: {rendered}"
+            );
+            assert!(
+                !rendered.contains("171") && !rendered.contains("ab"),
+                "debug output must not leak secret bytes: {rendered}"
+            );
+        }
     }
 }

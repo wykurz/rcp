@@ -26,7 +26,8 @@ The remote copy system consists of three distinct components:
    concurrently.
 3. Master spawns source rcpd via SSH: `ssh user@host1 rcpd --role=source ...`
 4. Source emits `RCP_READY <hex_fingerprint|-> <F> <E>` as the first stderr record (`-` when
-   `--no-encryption` disables source↔destination TLS) and switches its SSH `stdin`/`stdout` pipes to
+   `--no-encryption` disables authentication or explicit `--remote-transport=ssh` skips daemon TLS
+   certificates in favor of loopback HMAC-SHA256) and switches its SSH `stdin`/`stdout` pipes to
    binary framed protocol I/O (redirecting process fd 1 to `stderr` so stray writes cannot corrupt
    framing). The master immediately starts the source stdout demux and stdin heartbeat tasks.
 5. Master constructs the destination configuration from source readiness, spawns destination rcpd,
@@ -63,16 +64,18 @@ must be nonzero, and must not exceed `tokio::sync::Semaphore::MAX_PERMITS`. Expl
 validated before remote-home expansion or SSH. For automatic capacity, the master validates the
 configured connection upper bound before remote side effects; the source resolves and validates the
 actual CPU-selected capacity before it announces readiness and before destination spawn. Wire
-revision 14 adds SSH data/control transport, direct-TCP fallback, load-balanced peer verification,
-and established-failure tracking (`PeerIdentity`, `DestinationTransport` including 3-host
-`source_peer` / `source_node_endpoint`, `MasterHello::Source::accept_timeout_sec`,
-`MasterHello::Destination::source_data_addrs`,
-`SourceMasterHello::{tunnel_target_ip, peer_identity, ssh_node_endpoint}`,
-`SourceMessage::DryRunReady`, `MasterToRcpd::SshFallbackEndpoints`,
-`RcpdToMaster::DirectConnectFailed`, and `RcpdResult::Failure::peer_connected`), building on
-revision 13's SSH `stdin`/`stdout` master↔rcpd transport (`RCP_READY`, `MasterToRcpd`,
-`RcpdToMaster`), revision 12's process statistics counters, and revision 11's receiver copy-buffer
-retention configuration. It requires exact-version rcp/rcpd binaries.
+revision 15 replaces bare optional TLS fingerprints in `MasterHello` with `PeerAuth` (`Tls`,
+`SshSharedSecret`, `AutoTlsOrSshSecret`, `None`) so SSH-tunneled streams authenticate via 1-RTT
+loopback-only mutual HMAC-SHA256 instead of double-encrypting inside SSH, building on revision 14's
+SSH data/control transport and `auto` fallback negotiation (`DestinationTransport`, `SshTarget`,
+`PeerIdentity`, `MasterToRcpd::SshFallbackEndpoints`, `RcpdToMaster::DirectConnectFailed`,
+`SourceMessage::DryRunReady`, `SourceMasterHello` (`tunnel_target_ip`, `peer_identity`,
+`ssh_node_endpoint`), `RcpdResult::Failure::peer_connected`,
+`MasterHello::Source::accept_timeout_sec`, `MasterHello::Destination::source_data_addrs`, and
+destination `--ssh-tunnels` descriptor accounting), revision 13's SSH `stdin`/`stdout` master↔rcpd
+transport (`RCP_READY`, `MasterToRcpd`, `RcpdToMaster`), revision 12's process statistics counters,
+and revision 11's receiver copy-buffer retention configuration. It requires exact-version rcp/rcpd
+binaries.
 
 Each daemon attempts to raise its soft descriptor limit to the inherited hard limit before runtime
 and admission setup (§7.8). For normal copies, it installs one joint leaf/directory resource plan
@@ -334,10 +337,22 @@ is selected, data never relays through the master host in 3-host topologies:
   immediately after accepting the control stream and before starting traversal so plaintext
   (`--no-encryption`) destinations distinguish an active preview (`peer_connected = true`) from an
   SSH forward denied before reaching source (`peer_connected = false`).
-- **Notice and TLS**: Any non-same-host transfer over SSH emits a default-visible `rcp::notice`
-  warning reporting the active tunnel count (and direct-TCP error reason on `auto` fallback).
-  Source↔Destination mutual TLS 1.3 remains enabled by default over SSH tunnels unless
-  `--no-encryption` is passed.
+- **Notice and stream security**: Any non-same-host transfer over SSH emits a default-visible
+  `rcp::notice` warning reporting the active tunnel count (and direct-TCP error reason on `auto`
+  fallback). When `--ssh-tunnels` is omitted, `K` defaults to `min(E, 16)` (matching the CPU-derived
+  remote copy concurrency up to 16); an explicit `--ssh-tunnels=N` overrides that default cap (still
+  bounded by `E`). Instead of double-encrypting with TLS inside SSH, SSH-tunneled streams (both
+  explicit `--remote-transport=ssh` and `--remote-transport=auto` after SSH fallback) authenticate
+  each control and data connection with a 1-RTT loopback-only mutual HMAC-SHA256 challenge-response
+  keyed by a fresh per-session 256-bit `SshAuthSecret` distributed in `MasterHello::peer_auth`,
+  followed by raw protocol frames encrypted on the wire by SSH. In `auto` mode, `source` requires a
+  loopback peer IP (`127.0.0.0/8`, `::1`, or IPv4-mapped `::ffff:127.0.0.0/104`) to accept SSH HMAC
+  auth so network peers can never downgrade off direct-TCP mTLS 1.3, and locks the control stream's
+  resolved mode for the entire data pool (when `--remote-transport=auto` is combined with an
+  explicit non-loopback `--bind-ip`, both direct TCP and SSH fallback stay on mTLS 1.3 because
+  forwards dial that non-loopback address). Explicit `--remote-transport=ssh` skips daemon TLS
+  certificate generation entirely. `--no-encryption` still disables both encryption and peer
+  authentication (`PeerAuth::None`).
 
 **Connection Establishment Order:**
 
@@ -357,35 +372,39 @@ is selected, data never relays through the master host in 3-host topologies:
 ### 1.4 Security Model
 
 Master ↔ rcpd control and tracing run inside the authenticated, encrypted SSH exec channel (no
-master-facing TCP port is opened). Source ↔ Destination TCP connections are encrypted and mutually
-authenticated using TLS 1.3 with self-signed certificates and fingerprint pinning. TLS 1.3 is pinned
-in the config (TLS 1.2 is never negotiated) — see the [Cipher Suites](security.md#cipher-suites)
-section of security.md.
+master-facing TCP port is opened). Direct Source ↔ Destination TCP connections are encrypted and
+mutually authenticated using TLS 1.3 with self-signed certificates and fingerprint pinning (TLS 1.2
+is never negotiated — see [Cipher Suites](security.md#cipher-suites)). SSH-tunneled Source ↔
+Destination connections (both explicit `--remote-transport=ssh` and loopback
+`--remote-transport=auto` fallback) are encrypted on the wire by SSH and authenticate each loopback
+stream with a 1-RTT mutual HMAC-SHA256 handshake keyed by a per-session secret distributed over SSH
+`stdin`, avoiding double bulk encryption.
 
 **Security Architecture:**
 
 - SSH authenticates, deploys, and carries all Master ↔ rcpd control and tracing traffic
-- Source and destination each generate an ephemeral self-signed certificate (master needs no TLS
-  certificate)
-- Each rcpd outputs its certificate fingerprint in `RCP_READY` on stderr (read by master via SSH)
-- Master distributes fingerprints over SSH stdin to source/destination for mutual TLS authentication
-- All Source ↔ Destination TCP connections use TLS 1.3 with mutual certificate fingerprint
-  verification
+- For direct TCP (and `auto`), source and destination each generate an ephemeral self-signed
+  certificate (master needs no TLS certificate), output its SHA-256 fingerprint in `RCP_READY` on
+  stderr, and receive their peer's `PeerAuth` policy from master over SSH `stdin`
+- Direct TCP connections use TLS 1.3 with mutual certificate fingerprint verification
+- SSH-tunneled connections (and loopback same-host copies under `--remote-transport=ssh`) skip bulk
+  TLS encryption and authenticate each loopback TCP stream with 1-RTT mutual HMAC-SHA256 (enforcing
+  a loopback peer IP on both endpoints)
 
 **Security Properties:**
 
-- **Confidentiality**: Master↔rcpd protected by SSH; Source↔Destination encrypted with AES-256-GCM
-  or ChaCha20-Poly1305
-- **Authentication**: SSH authenticates Master↔rcpd; mutual certificate fingerprint verification
-  prevents unauthorized Source↔Destination connections
+- **Confidentiality**: Master↔rcpd and SSH-tunneled transfers protected by SSH; direct TCP
+  Source↔Destination encrypted with AES-256-GCM or ChaCha20-Poly1305
+- **Authentication**: SSH authenticates Master↔rcpd; direct TCP uses mutual TLS certificate
+  fingerprint verification and SSH-tunneled streams use 1-RTT loopback mutual HMAC-SHA256
 - **Forward secrecy**: Ephemeral key exchange on both SSH and TLS 1.3
-- **Integrity**: AEAD ensures data cannot be tampered with
+- **Integrity**: SSH MAC/AEAD on SSH channels; TLS AEAD on direct TCP
 
 **Opt-out:**
 
-- Use `--no-encryption` for trusted networks where performance is critical. It disables TLS and
-  certificate authentication on Source ↔ Destination TCP connections; Master ↔ rcpd remains
-  protected by SSH.
+- Use `--no-encryption` for trusted networks where performance is critical. It disables both
+  encryption and peer authentication on Source ↔ Destination TCP connections (`PeerAuth::None`);
+  Master ↔ rcpd remains protected by SSH.
 - See [security.md](security.md) for detailed threat model and best practices
 
 ### 1.5 Scoped Performance Timings
@@ -500,8 +519,10 @@ do not establish semantic or daemon-spawn compatibility.
   `auto` fallback) until tearing down (closing `stdin` for EOF); each rcpd keeps a reader on `stdin`
   as its unified liveness watchdog for the whole operation (§6.3).
 - **Variants**:
-  - `Source { src, dst, dest_cert_fingerprint, filter, dry_run, capture, accept_timeout_sec }`:
-    Tells source rcpd what to copy
+  - `Source { src, dst, peer_auth, filter, dry_run, capture, accept_timeout_sec }`: Tells source
+    rcpd what to copy
+    - `peer_auth`: `PeerAuth` policy (`Tls { peer_fingerprint }`, `SshSharedSecret { secret }`,
+      `AutoTlsOrSshSecret { peer_fingerprint, secret }`, or `None`)
     - `filter`: Optional filter settings for include/exclude patterns (source-side filtering reduces
       network traffic)
     - `dry_run`: Optional dry-run mode (brief, all, or explain) for previewing operations without
@@ -513,11 +534,12 @@ do not establish semantic or daemon-spawn compatibility.
     - `accept_timeout_sec`: Seconds the source waits for destination's control connection, widened
       beyond `--remote-copy-conn-timeout-sec` when SSH tunnel bring-up or `auto` direct-TCP probing
       precedes destination connect.
-  - `Destination { source_control_addr, source_data_addrs, server_name, preserve, source_cert_fingerprint, dry_run, transport }`:
+  - `Destination { source_control_addr, source_data_addrs, server_name, preserve, peer_auth, dry_run, transport }`:
     Tells destination where and how to connect (control address, pooled data address list striped
-    round-robin, and `DestinationTransport` mode: `Direct`, `MasterSshTunnel`, `AutoMasterSsh`,
-    `DirectSsh`, or `AutoDirectSsh`). Note: empty directory cleanup decisions are communicated
-    per-directory via `keep_if_empty` in `DirectoryBegin` messages rather than a global flag.
+    round-robin, `PeerAuth` policy, and `DestinationTransport` mode: `Direct`, `MasterSshTunnel`,
+    `AutoMasterSsh`, `DirectSsh`, or `AutoDirectSsh`). Note: empty directory cleanup decisions are
+    communicated per-directory via `keep_if_empty` in `DirectoryBegin` messages rather than a global
+    flag.
     - `dry_run`: The master's explicit preview-only policy. Destination starts no data workers and
       waits for `DiscoveryComplete(false)` over control, then sends `DestinationDone`. Source must
       receive that acknowledgement; premature control EOF is a failure. The data connection timeout
@@ -542,9 +564,9 @@ do not establish semantic or daemon-spawn compatibility.
 - **Variants**:
   - `Success { message, summary, runtime_stats }`
   - `Failure { error, summary, runtime_stats, peer_connected }`: `peer_connected` is true once the
-    source↔destination control session (including TLS authentication when enabled) was established;
-    when true, the master awaits the peer's terminal result without applying the pre-connection
-    peer-failure grace cutoff so partial copied/skipped counts survive.
+    source↔destination control session (including mutual TLS or SSH loopback HMAC authentication
+    when enabled) was established; when true, the master awaits the peer's terminal result without
+    applying the pre-connection peer-failure grace cutoff so partial copied/skipped counts survive.
 - **`runtime_stats`**: what the rcpd process used, measured by itself just before it reports: user
   and kernel CPU time in milliseconds, peak resident set size in bytes, voluntary and involuntary
   context switches, and minor and major page faults. Every figure covers the whole process. The

@@ -1,9 +1,15 @@
-//! TLS support for encrypted and authenticated connections.
+//! Transport security for Source↔Destination TCP connections.
 //!
-//! This module provides certificate generation and mutual-TLS configuration for
-//! Source↔Destination connections (source is server; destination presents a client certificate,
-//! and both sides verify each other's SSH-distributed certificate fingerprints). Master↔rcpd
-//! control and tracing travel directly over SSH stdio and do not use TLS.
+//! This module provides:
+//! - Ephemeral self-signed certificate generation and mutual TLS 1.3 with fingerprint pinning for
+//!   direct TCP connections (source is server; destination presents a client certificate, and both
+//!   sides verify each other's SSH-distributed fingerprints).
+//! - Loopback-only 1-RTT mutual HMAC-SHA256 authentication for SSH-tunneled connections, providing
+//!   multi-user loopback isolation without adding a second bulk encryption layer inside SSH.
+//! - The single bounded handshake funnel ([`accept_control_bounded`], [`accept_bounded`], and
+//!   [`connect_bounded`]) used by every production control and data connection.
+//!
+//! Master↔rcpd control and tracing travel directly over SSH stdio and do not use this layer.
 use anyhow::Context;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -13,6 +19,7 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A certificate fingerprint (SHA-256 of DER-encoded certificate).
 pub type Fingerprint = [u8; 32];
@@ -311,44 +318,270 @@ impl ClientCertVerifier for FingerprintClientCertVerifier {
 }
 
 // ============================================================================
-// Bounded handshakes
+// Bounded handshakes (mutual TLS 1.3 and loopback SSH-tunnel HMAC-SHA256)
 // ============================================================================
 //
-// EVERY production TLS handshake goes through `accept_bounded` / `connect_bounded`. A bare
-// `TlsAcceptor::accept` / `TlsConnector::connect` outside this module is a bug and is rejected by
-// `scripts/check-tls-handshake-timeout.sh`.
+// EVERY production TLS or SSH-auth handshake goes through `accept_control_bounded` /
+// `accept_bounded` / `connect_bounded`. A bare `TlsAcceptor::accept` / `TlsConnector::connect`
+// outside this module is a bug and is rejected by `scripts/check-tls-handshake-timeout.sh`.
 //
 // Why a shared helper rather than a timeout at each call site: the handshake runs AFTER the TCP
-// accept/connect has already been bounded, so a peer that completes TCP and then sends no TLS bytes
+// accept/connect has already been bounded, so a peer that completes TCP and then sends no bytes
 // stalls the future forever — and on the rcpd listener, whose accepts are sequential and inline,
-// one such peer blocks the legitimate master from ever connecting. That timeout was added at three
+// one such peer blocks the legitimate peer from ever connecting. That timeout was added at three
 // call sites and forgotten at two, which is exactly the failure mode a single funnel removes. The
 // helpers also own the identical `split` → `Box` → `SendStream`/`RecvStream` wrapping (and the
-// non-TLS fallback) that every site otherwise repeats.
+// SSH-auth / plaintext paths) that every site otherwise repeats.
 
-/// Wrap an accepted TCP stream in TLS (when `acceptor` is set) and split it into framed streams,
-/// bounding the handshake by `timeout`.
+const SSH_AUTH_MAGIC: [u8; 4] = *b"RCPA";
+const TLS_HANDSHAKE_RECORD_TYPE: u8 = 0x16;
+const SSH_AUTH_SERVER_DOMAIN: &[u8] = b"rcp-ssh-auth-v1:server";
+const SSH_AUTH_CLIENT_DOMAIN: &[u8] = b"rcp-ssh-auth-v1:client";
+
+/// Logical stream purpose bound into the SSH-tunnel HMAC authentication transcript so a control
+/// handshake cannot be replayed onto a data stream or vice versa.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamKind {
+    Control,
+    Data,
+}
+
+impl StreamKind {
+    const fn domain_byte(self) -> u8 {
+        match self {
+            Self::Control => 0x01,
+            Self::Data => 0x02,
+        }
+    }
+}
+
+/// Concrete single-mode server stream acceptor (used for data connections after control resolves).
+#[derive(Clone)]
+pub enum StreamAcceptor {
+    Tls(Arc<tokio_rustls::TlsAcceptor>),
+    SshAuth(crate::protocol::SshAuthSecret),
+    Plaintext,
+}
+
+impl StreamAcceptor {
+    /// Human-readable label for logging.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::Tls(_) => "mutual TLS 1.3",
+            Self::SshAuth(_) => "SSH loopback HMAC-SHA256 auth",
+            Self::Plaintext => "disabled (plaintext)",
+        }
+    }
+}
+
+/// Server stream acceptor for the initial source control connection.
 ///
-/// `purpose` names the connection in error messages (e.g. "control", "data").
-pub async fn accept_bounded(
-    acceptor: Option<&tokio_rustls::TlsAcceptor>,
+/// In `--remote-transport=auto`, [`Self::Auto`] inspects the first client byte on the control
+/// connection (requiring a loopback peer IP for [`StreamAcceptor::SshAuth`]) and locks the
+/// resolved concrete [`StreamAcceptor`] for all subsequent data connections.
+#[derive(Clone)]
+pub enum ControlStreamAcceptor {
+    Tls(Arc<tokio_rustls::TlsAcceptor>),
+    SshAuth(crate::protocol::SshAuthSecret),
+    Auto {
+        tls: Arc<tokio_rustls::TlsAcceptor>,
+        ssh_auth: crate::protocol::SshAuthSecret,
+    },
+    Plaintext,
+}
+
+impl ControlStreamAcceptor {
+    /// Construct the source control acceptor from the daemon's local TLS certificate and the
+    /// master-supplied [`crate::protocol::PeerAuth`] policy.
+    pub fn from_peer_auth(
+        cert_key: Option<&CertifiedKey>,
+        peer_auth: &crate::protocol::PeerAuth,
+    ) -> anyhow::Result<Self> {
+        peer_auth.validate_cert_presence(cert_key.is_some())?;
+        match (peer_auth, cert_key) {
+            (crate::protocol::PeerAuth::Tls { peer_fingerprint }, Some(cert)) => {
+                let server_config = create_server_config_with_client_auth(cert, *peer_fingerprint)
+                    .context("failed to create TLS server config with client auth")?;
+                Ok(Self::Tls(Arc::new(tokio_rustls::TlsAcceptor::from(
+                    server_config,
+                ))))
+            }
+            (crate::protocol::PeerAuth::SshSharedSecret { secret }, None) => {
+                Ok(Self::SshAuth(secret.clone()))
+            }
+            (
+                crate::protocol::PeerAuth::AutoTlsOrSshSecret {
+                    peer_fingerprint,
+                    secret,
+                },
+                Some(cert),
+            ) => {
+                let server_config = create_server_config_with_client_auth(cert, *peer_fingerprint)
+                    .context("failed to create TLS server config with client auth")?;
+                Ok(Self::Auto {
+                    tls: Arc::new(tokio_rustls::TlsAcceptor::from(server_config)),
+                    ssh_auth: secret.clone(),
+                })
+            }
+            (crate::protocol::PeerAuth::None, None) => Ok(Self::Plaintext),
+            _ => unreachable!("validate_cert_presence checked certificate alignment"),
+        }
+    }
+
+    /// Human-readable label for logging.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::Tls(_) => "mutual TLS 1.3",
+            Self::SshAuth(_) => "SSH loopback HMAC-SHA256 auth",
+            Self::Auto { .. } => "auto (mutual TLS 1.3 or SSH loopback HMAC-SHA256 auth)",
+            Self::Plaintext => "disabled (plaintext)",
+        }
+    }
+}
+
+/// Client stream connector used by destination for both control and data streams.
+#[derive(Clone)]
+pub enum StreamConnector {
+    Tls(Arc<tokio_rustls::TlsConnector>),
+    SshAuth(crate::protocol::SshAuthSecret),
+    Plaintext,
+}
+
+impl StreamConnector {
+    /// Construct the destination connector once transport selection knows whether the connection
+    /// traverses an SSH tunnel (`via_ssh_tunnel`).
+    pub fn from_peer_auth(
+        cert_key: Option<&CertifiedKey>,
+        peer_auth: &crate::protocol::PeerAuth,
+        via_ssh_tunnel: bool,
+    ) -> anyhow::Result<Self> {
+        peer_auth.validate_cert_presence(cert_key.is_some())?;
+        match (peer_auth, cert_key, via_ssh_tunnel) {
+            (crate::protocol::PeerAuth::Tls { peer_fingerprint }, Some(cert), _) => {
+                let client_config = create_client_config_with_cert(cert, *peer_fingerprint)
+                    .context("failed to create TLS client config")?;
+                Ok(Self::Tls(Arc::new(tokio_rustls::TlsConnector::from(
+                    client_config,
+                ))))
+            }
+            (crate::protocol::PeerAuth::SshSharedSecret { secret }, None, _) => {
+                Ok(Self::SshAuth(secret.clone()))
+            }
+            (
+                crate::protocol::PeerAuth::AutoTlsOrSshSecret {
+                    peer_fingerprint, ..
+                },
+                Some(cert),
+                false,
+            ) => {
+                let client_config = create_client_config_with_cert(cert, *peer_fingerprint)
+                    .context("failed to create TLS client config")?;
+                Ok(Self::Tls(Arc::new(tokio_rustls::TlsConnector::from(
+                    client_config,
+                ))))
+            }
+            (crate::protocol::PeerAuth::AutoTlsOrSshSecret { secret, .. }, Some(_), true) => {
+                Ok(Self::SshAuth(secret.clone()))
+            }
+            (crate::protocol::PeerAuth::None, None, _) => Ok(Self::Plaintext),
+            _ => unreachable!("validate_cert_presence checked certificate alignment"),
+        }
+    }
+
+    /// True when [`connect_bounded`] performs a mutual end-to-end authentication handshake with
+    /// source `rcpd` (so completion proves the peer is reachable, unlike plaintext TCP over `-L`).
+    #[must_use]
+    pub const fn authenticates_peer(&self) -> bool {
+        matches!(self, Self::Tls(_) | Self::SshAuth(_))
+    }
+
+    /// Human-readable label for logging.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::Tls(_) => "mutual TLS 1.3",
+            Self::SshAuth(_) => "SSH loopback HMAC-SHA256 auth",
+            Self::Plaintext => "disabled (plaintext)",
+        }
+    }
+}
+
+fn hmac_sha256(key: &[u8; 32], chunks: &[&[u8]]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for (idx, &byte) in key.iter().enumerate() {
+        ipad[idx] ^= byte;
+        opad[idx] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    for chunk in chunks {
+        inner.update(chunk);
+    }
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+fn ct_eq_32(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for idx in 0..32 {
+        diff |= left[idx] ^ right[idx];
+    }
+    std::hint::black_box(diff) == 0
+}
+
+fn ssh_auth_tag(
+    secret: &crate::protocol::SshAuthSecret,
+    domain: &[u8],
+    kind: StreamKind,
+    client_nonce: &[u8; 32],
+    server_nonce: &[u8; 32],
+) -> [u8; 32] {
+    let kind_byte = [kind.domain_byte()];
+    hmac_sha256(
+        secret.as_bytes(),
+        &[domain, &kind_byte, client_nonce, server_nonce],
+    )
+}
+
+/// Return true when `ip` is a loopback address (IPv4 `127.0.0.0/8`, IPv6 `::1`, or IPv4-mapped
+/// `::ffff:127.0.0.0/104` delivered by dual-stack IPv6 listeners).
+#[must_use]
+pub fn is_loopback_peer(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+fn ensure_loopback_peer(ip: std::net::IpAddr, purpose: &str) -> anyhow::Result<()> {
+    if !is_loopback_peer(ip) {
+        anyhow::bail!(
+            "refusing non-TLS SSH authentication handshake on {purpose} connection from non-loopback peer {ip}"
+        );
+    }
+    Ok(())
+}
+
+async fn accept_tls_stream(
+    acceptor: &tokio_rustls::TlsAcceptor,
     stream: tokio::net::TcpStream,
-    timeout: std::time::Duration,
     purpose: &str,
 ) -> anyhow::Result<(
     crate::streams::BoxedSendStream,
     crate::streams::BoxedRecvStream,
 )> {
-    let Some(acceptor) = acceptor else {
-        let (read_half, write_half) = stream.into_split();
-        return Ok(split_into_streams(
-            Box::new(write_half) as crate::streams::BoxedWrite,
-            Box::new(read_half) as crate::streams::BoxedRead,
-        ));
-    };
-    let tls_stream = tokio::time::timeout(timeout, acceptor.accept(stream))
+    let tls_stream = acceptor
+        .accept(stream)
         .await
-        .with_context(|| format!("TLS handshake timed out for {purpose} connection"))?
         .with_context(|| format!("TLS handshake failed for {purpose} connection"))?;
     let (read_half, write_half) = tokio::io::split(tls_stream);
     Ok(split_into_streams(
@@ -357,40 +590,295 @@ pub async fn accept_bounded(
     ))
 }
 
-/// Wrap a connected TCP stream in TLS (when `connector` is set) and split it into framed streams,
-/// bounding the handshake by `timeout`.
+async fn accept_ssh_auth_stream(
+    mut stream: tokio::net::TcpStream,
+    secret: &crate::protocol::SshAuthSecret,
+    kind: StreamKind,
+    purpose: &str,
+) -> anyhow::Result<(
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+)> {
+    let peer_ip = stream
+        .peer_addr()
+        .with_context(|| format!("failed to inspect peer address for {purpose} connection"))?
+        .ip();
+    ensure_loopback_peer(peer_ip, purpose)?;
+    let mut client_hello = [0u8; 36];
+    stream
+        .read_exact(&mut client_hello)
+        .await
+        .with_context(|| {
+            format!("SSH auth handshake failed reading client hello for {purpose} connection")
+        })?;
+    if client_hello[..4] != SSH_AUTH_MAGIC {
+        anyhow::bail!("SSH auth handshake failed for {purpose} connection: invalid protocol magic");
+    }
+    let client_nonce: [u8; 32] = client_hello[4..36]
+        .try_into()
+        .expect("slice length is fixed at 32 bytes");
+    let server_nonce: [u8; 32] = rand::random();
+    let server_tag = ssh_auth_tag(
+        secret,
+        SSH_AUTH_SERVER_DOMAIN,
+        kind,
+        &client_nonce,
+        &server_nonce,
+    );
+    let mut server_hello = [0u8; 64];
+    server_hello[..32].copy_from_slice(&server_nonce);
+    server_hello[32..64].copy_from_slice(&server_tag);
+    stream.write_all(&server_hello).await.with_context(|| {
+        format!("SSH auth handshake failed sending server challenge for {purpose} connection")
+    })?;
+    stream.flush().await.with_context(|| {
+        format!("SSH auth handshake failed flushing server challenge for {purpose} connection")
+    })?;
+    let mut client_tag = [0u8; 32];
+    stream.read_exact(&mut client_tag).await.with_context(|| {
+        format!("SSH auth handshake failed reading client proof for {purpose} connection")
+    })?;
+    let expected_client_tag = ssh_auth_tag(
+        secret,
+        SSH_AUTH_CLIENT_DOMAIN,
+        kind,
+        &client_nonce,
+        &server_nonce,
+    );
+    if !ct_eq_32(&client_tag, &expected_client_tag) {
+        anyhow::bail!(
+            "SSH auth handshake failed for {purpose} connection: client authentication tag mismatch"
+        );
+    }
+    let (read_half, write_half) = stream.into_split();
+    Ok(split_into_streams(
+        Box::new(write_half) as crate::streams::BoxedWrite,
+        Box::new(read_half) as crate::streams::BoxedRead,
+    ))
+}
+
+async fn connect_ssh_auth_stream(
+    mut stream: tokio::net::TcpStream,
+    secret: &crate::protocol::SshAuthSecret,
+    kind: StreamKind,
+    purpose: &str,
+) -> anyhow::Result<(
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+)> {
+    let peer_ip = stream
+        .peer_addr()
+        .with_context(|| format!("failed to inspect peer address for {purpose} connection"))?
+        .ip();
+    ensure_loopback_peer(peer_ip, purpose)?;
+    let client_nonce: [u8; 32] = rand::random();
+    let mut client_hello = [0u8; 36];
+    client_hello[..4].copy_from_slice(&SSH_AUTH_MAGIC);
+    client_hello[4..36].copy_from_slice(&client_nonce);
+    stream.write_all(&client_hello).await.with_context(|| {
+        format!("SSH auth handshake failed sending client hello for {purpose} connection")
+    })?;
+    stream.flush().await.with_context(|| {
+        format!("SSH auth handshake failed flushing client hello for {purpose} connection")
+    })?;
+    let mut server_hello = [0u8; 64];
+    stream
+        .read_exact(&mut server_hello)
+        .await
+        .with_context(|| {
+            format!("SSH auth handshake failed reading server response for {purpose} connection")
+        })?;
+    let server_nonce: [u8; 32] = server_hello[..32]
+        .try_into()
+        .expect("slice length is fixed at 32 bytes");
+    let server_tag: [u8; 32] = server_hello[32..64]
+        .try_into()
+        .expect("slice length is fixed at 32 bytes");
+    let expected_server_tag = ssh_auth_tag(
+        secret,
+        SSH_AUTH_SERVER_DOMAIN,
+        kind,
+        &client_nonce,
+        &server_nonce,
+    );
+    if !ct_eq_32(&server_tag, &expected_server_tag) {
+        anyhow::bail!(
+            "SSH auth handshake failed for {purpose} connection: server authentication tag mismatch"
+        );
+    }
+    let client_tag = ssh_auth_tag(
+        secret,
+        SSH_AUTH_CLIENT_DOMAIN,
+        kind,
+        &client_nonce,
+        &server_nonce,
+    );
+    stream.write_all(&client_tag).await.with_context(|| {
+        format!("SSH auth handshake failed sending client proof for {purpose} connection")
+    })?;
+    stream.flush().await.with_context(|| {
+        format!("SSH auth handshake failed flushing client proof for {purpose} connection")
+    })?;
+    let (read_half, write_half) = stream.into_split();
+    Ok(split_into_streams(
+        Box::new(write_half) as crate::streams::BoxedWrite,
+        Box::new(read_half) as crate::streams::BoxedRead,
+    ))
+}
+
+/// Authenticate and split an accepted source control connection, resolving [`ControlStreamAcceptor::Auto`]
+/// into the concrete [`StreamAcceptor`] to enforce on all subsequent data connections.
 ///
-/// `server_name` is only an SNI placeholder — peers are verified by certificate fingerprint, not
-/// hostname (see [`create_client_config_with_cert`]). It is a parameter rather than a constant
-/// because the two connection kinds send different values on the wire.
-pub async fn connect_bounded(
-    connector: Option<&tokio_rustls::TlsConnector>,
-    server_name: &'static str,
+/// The entire handshake (including first-byte peek in `Auto` mode) is bounded by `timeout`.
+pub async fn accept_control_bounded(
+    acceptor: &ControlStreamAcceptor,
     stream: tokio::net::TcpStream,
     timeout: std::time::Duration,
     purpose: &str,
 ) -> anyhow::Result<(
     crate::streams::BoxedSendStream,
     crate::streams::BoxedRecvStream,
+    StreamAcceptor,
 )> {
-    let Some(connector) = connector else {
-        let (read_half, write_half) = stream.into_split();
-        return Ok(split_into_streams(
-            Box::new(write_half) as crate::streams::BoxedWrite,
-            Box::new(read_half) as crate::streams::BoxedRead,
-        ));
-    };
-    let server_name = ServerName::try_from(server_name)
-        .with_context(|| format!("invalid server name for {purpose} connection"))?;
-    let tls_stream = tokio::time::timeout(timeout, connector.connect(server_name, stream))
+    match acceptor {
+        ControlStreamAcceptor::Plaintext => {
+            let (read_half, write_half) = stream.into_split();
+            let (send, recv) = split_into_streams(
+                Box::new(write_half) as crate::streams::BoxedWrite,
+                Box::new(read_half) as crate::streams::BoxedRead,
+            );
+            Ok((send, recv, StreamAcceptor::Plaintext))
+        }
+        ControlStreamAcceptor::Tls(tls) => {
+            let (send, recv) =
+                tokio::time::timeout(timeout, accept_tls_stream(tls, stream, purpose))
+                    .await
+                    .with_context(|| {
+                        format!("TLS handshake timed out for {purpose} connection")
+                    })??;
+            Ok((send, recv, StreamAcceptor::Tls(Arc::clone(tls))))
+        }
+        ControlStreamAcceptor::SshAuth(secret) => {
+            let (send, recv) = tokio::time::timeout(
+                timeout,
+                accept_ssh_auth_stream(stream, secret, StreamKind::Control, purpose),
+            )
+            .await
+            .with_context(|| format!("SSH auth handshake timed out for {purpose} connection"))??;
+            Ok((send, recv, StreamAcceptor::SshAuth(secret.clone())))
+        }
+        ControlStreamAcceptor::Auto { tls, ssh_auth } => tokio::time::timeout(timeout, async {
+            let mut first_byte = [0u8; 1];
+            let peeked = stream
+                .peek(&mut first_byte)
+                .await
+                .with_context(|| format!("handshake peek failed for {purpose} connection"))?;
+            if peeked == 0 {
+                anyhow::bail!("peer closed {purpose} connection before starting handshake");
+            }
+            match first_byte[0] {
+                TLS_HANDSHAKE_RECORD_TYPE => {
+                    let (send, recv) = accept_tls_stream(tls, stream, purpose).await?;
+                    Ok((send, recv, StreamAcceptor::Tls(Arc::clone(tls))))
+                }
+                b if b == SSH_AUTH_MAGIC[0] => {
+                    let (send, recv) =
+                        accept_ssh_auth_stream(stream, ssh_auth, StreamKind::Control, purpose)
+                            .await?;
+                    Ok((send, recv, StreamAcceptor::SshAuth(ssh_auth.clone())))
+                }
+                other => {
+                    anyhow::bail!(
+                        "unexpected handshake prefix byte 0x{other:02x} for {purpose} connection"
+                    );
+                }
+            }
+        })
         .await
-        .with_context(|| format!("TLS handshake timed out for {purpose} connection"))?
-        .with_context(|| format!("TLS handshake failed for {purpose} connection"))?;
-    let (read_half, write_half) = tokio::io::split(tls_stream);
-    Ok(split_into_streams(
-        Box::new(write_half) as crate::streams::BoxedWrite,
-        Box::new(read_half) as crate::streams::BoxedRead,
-    ))
+        .with_context(|| format!("stream handshake timed out for {purpose} connection"))?,
+    }
+}
+
+/// Authenticate an accepted TCP stream under a concrete [`StreamAcceptor`] and split it into
+/// framed streams, bounding the handshake by `timeout`.
+///
+/// `purpose` names the connection in error messages (e.g. "control", "data").
+pub async fn accept_bounded(
+    acceptor: &StreamAcceptor,
+    stream: tokio::net::TcpStream,
+    timeout: std::time::Duration,
+    kind: StreamKind,
+    purpose: &str,
+) -> anyhow::Result<(
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+)> {
+    match acceptor {
+        StreamAcceptor::Plaintext => {
+            let (read_half, write_half) = stream.into_split();
+            Ok(split_into_streams(
+                Box::new(write_half) as crate::streams::BoxedWrite,
+                Box::new(read_half) as crate::streams::BoxedRead,
+            ))
+        }
+        StreamAcceptor::Tls(tls) => {
+            tokio::time::timeout(timeout, accept_tls_stream(tls, stream, purpose))
+                .await
+                .with_context(|| format!("TLS handshake timed out for {purpose} connection"))?
+        }
+        StreamAcceptor::SshAuth(secret) => tokio::time::timeout(
+            timeout,
+            accept_ssh_auth_stream(stream, secret, kind, purpose),
+        )
+        .await
+        .with_context(|| format!("SSH auth handshake timed out for {purpose} connection"))?,
+    }
+}
+
+/// Authenticate a connected TCP stream under [`StreamConnector`] and split it into framed streams,
+/// bounding the handshake by `timeout`.
+///
+/// `server_name` is only an SNI placeholder for TLS — peers are verified by certificate
+/// fingerprint, not hostname (see [`create_client_config_with_cert`]).
+pub async fn connect_bounded(
+    connector: &StreamConnector,
+    server_name: &'static str,
+    stream: tokio::net::TcpStream,
+    timeout: std::time::Duration,
+    kind: StreamKind,
+    purpose: &str,
+) -> anyhow::Result<(
+    crate::streams::BoxedSendStream,
+    crate::streams::BoxedRecvStream,
+)> {
+    match connector {
+        StreamConnector::Plaintext => {
+            let (read_half, write_half) = stream.into_split();
+            Ok(split_into_streams(
+                Box::new(write_half) as crate::streams::BoxedWrite,
+                Box::new(read_half) as crate::streams::BoxedRead,
+            ))
+        }
+        StreamConnector::Tls(tls) => {
+            let server_name = ServerName::try_from(server_name)
+                .with_context(|| format!("invalid server name for {purpose} connection"))?;
+            let tls_stream = tokio::time::timeout(timeout, tls.connect(server_name, stream))
+                .await
+                .with_context(|| format!("TLS handshake timed out for {purpose} connection"))?
+                .with_context(|| format!("TLS handshake failed for {purpose} connection"))?;
+            let (read_half, write_half) = tokio::io::split(tls_stream);
+            Ok(split_into_streams(
+                Box::new(write_half) as crate::streams::BoxedWrite,
+                Box::new(read_half) as crate::streams::BoxedRead,
+            ))
+        }
+        StreamConnector::SshAuth(secret) => tokio::time::timeout(
+            timeout,
+            connect_ssh_auth_stream(stream, secret, kind, purpose),
+        )
+        .await
+        .with_context(|| format!("SSH auth handshake timed out for {purpose} connection"))?,
+    }
 }
 
 /// SNI placeholder for destination→source connections. Authentication is by certificate
@@ -868,5 +1356,440 @@ mod integration_tests {
             "a server pinned to TLS 1.3 must reject a client that offers only TLS 1.2"
         );
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_test_vectors() {
+        // RFC 4231 test case 1: 20-byte key zero-padded to 32 bytes (identical to 64-byte HMAC pad)
+        let mut key1 = [0u8; 32];
+        key1[..20].fill(0x0b);
+        assert_eq!(
+            hex::encode(hmac_sha256(&key1, &[b"Hi There"])),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // RFC 4231 test case 2: "Jefe"
+        let mut key2 = [0u8; 32];
+        key2[..4].copy_from_slice(b"Jefe");
+        assert_eq!(
+            hex::encode(hmac_sha256(&key2, &[b"what do ya want ", b"for nothing?"])),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // RFC 4231 test case 4: 25-byte key
+        let mut key4 = [0u8; 32];
+        for (idx, slot) in key4[..25].iter_mut().enumerate() {
+            *slot = (idx + 1) as u8;
+        }
+        let data4 = [0xcd_u8; 50];
+        assert_eq!(
+            hex::encode(hmac_sha256(&key4, &[&data4])),
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b"
+        );
+        // Full 32-byte non-zero key so every key byte is exercised
+        let key_full: [u8; 32] = std::array::from_fn(|i| (i + 1) as u8);
+        assert_eq!(
+            hex::encode(hmac_sha256(&key_full, &[b"rcp-32-byte-key-test"])),
+            "406badabb4f9ff36cdb969aa2cd5e7d2c6f7bb333e2eabf82d3131863e22377f"
+        );
+    }
+
+    #[test]
+    fn loopback_peer_check_accepts_ipv4_ipv6_and_mapped_loopback_only() {
+        for addr in ["127.0.0.1", "127.0.0.42", "::1", "::ffff:127.0.0.1"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(is_loopback_peer(ip), "expected loopback for {addr}");
+            assert!(ensure_loopback_peer(ip, "control").is_ok());
+        }
+        for addr in [
+            "0.0.0.0",
+            "::",
+            "::127.0.0.1",
+            "10.0.0.1",
+            "192.0.2.5",
+            "2001:db8::1",
+            "::ffff:10.0.0.1",
+        ] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(!is_loopback_peer(ip), "expected non-loopback for {addr}");
+            assert!(ensure_loopback_peer(ip, "control").is_err());
+        }
+    }
+
+    #[test]
+    fn peer_auth_constructors_enforce_certificate_alignment_and_auth_flag() {
+        install_crypto_provider();
+        let cert = generate_self_signed_cert().unwrap();
+        let peer_fp = [0x42; 32];
+        let secret = crate::protocol::SshAuthSecret::from_bytes([0x99; 32]);
+        let tls_auth = crate::protocol::PeerAuth::Tls {
+            peer_fingerprint: peer_fp,
+        };
+        let ssh_auth = crate::protocol::PeerAuth::SshSharedSecret {
+            secret: secret.clone(),
+        };
+        let auto_auth = crate::protocol::PeerAuth::AutoTlsOrSshSecret {
+            peer_fingerprint: peer_fp,
+            secret,
+        };
+        let none_auth = crate::protocol::PeerAuth::None;
+        assert!(ControlStreamAcceptor::from_peer_auth(Some(&cert), &tls_auth).is_ok());
+        assert!(ControlStreamAcceptor::from_peer_auth(None, &tls_auth).is_err());
+        assert!(ControlStreamAcceptor::from_peer_auth(None, &ssh_auth).is_ok());
+        assert!(ControlStreamAcceptor::from_peer_auth(Some(&cert), &ssh_auth).is_err());
+        assert!(ControlStreamAcceptor::from_peer_auth(Some(&cert), &auto_auth).is_ok());
+        assert!(ControlStreamAcceptor::from_peer_auth(None, &auto_auth).is_err());
+        assert!(ControlStreamAcceptor::from_peer_auth(None, &none_auth).is_ok());
+        assert!(ControlStreamAcceptor::from_peer_auth(Some(&cert), &none_auth).is_err());
+        let c_tls = StreamConnector::from_peer_auth(Some(&cert), &tls_auth, false).unwrap();
+        assert!(c_tls.authenticates_peer());
+        let c_ssh = StreamConnector::from_peer_auth(None, &ssh_auth, true).unwrap();
+        assert!(c_ssh.authenticates_peer());
+        let c_auto_direct =
+            StreamConnector::from_peer_auth(Some(&cert), &auto_auth, false).unwrap();
+        assert!(matches!(c_auto_direct, StreamConnector::Tls(_)));
+        assert!(c_auto_direct.authenticates_peer());
+        let c_auto_ssh = StreamConnector::from_peer_auth(Some(&cert), &auto_auth, true).unwrap();
+        assert!(matches!(c_auto_ssh, StreamConnector::SshAuth(_)));
+        assert!(c_auto_ssh.authenticates_peer());
+        let c_plain = StreamConnector::from_peer_auth(None, &none_auth, true).unwrap();
+        assert!(!c_plain.authenticates_peer());
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_round_trip_and_framed_io_succeed() {
+        let secret = crate::protocol::SshAuthSecret::generate();
+        let acceptor = ControlStreamAcceptor::SshAuth(secret.clone());
+        let connector = StreamConnector::SshAuth(secret);
+        let timeout = std::time::Duration::from_secs(5);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut send, mut recv, data_acceptor) =
+                accept_control_bounded(&acceptor, stream, timeout, "control")
+                    .await
+                    .unwrap();
+            assert!(matches!(data_acceptor, StreamAcceptor::SshAuth(_)));
+            let msg: String = recv.recv_object().await.unwrap().unwrap();
+            assert_eq!(msg, "hello-from-dest");
+            send.send_control_message(&"hello-from-source".to_string())
+                .await
+                .unwrap();
+            send.close().await.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (mut send, mut recv) = connect_bounded(
+            &connector,
+            SERVER_NAME_SOURCE,
+            stream,
+            timeout,
+            StreamKind::Control,
+            "control",
+        )
+        .await
+        .unwrap();
+        send.send_control_message(&"hello-from-dest".to_string())
+            .await
+            .unwrap();
+        let reply: String = recv.recv_object().await.unwrap().unwrap();
+        assert_eq!(reply, "hello-from-source");
+        send.close().await.unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssh_auth_rejects_wrong_secret_reflection_cross_kind_and_stall() {
+        let secret_a = crate::protocol::SshAuthSecret::from_bytes([0x11; 32]);
+        let secret_b = crate::protocol::SshAuthSecret::from_bytes([0x22; 32]);
+        let timeout = std::time::Duration::from_secs(2);
+        // 1. Wrong secret rejected by client (and server sees disconnect)
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_acceptor = StreamAcceptor::SshAuth(secret_a.clone());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert!(
+                    accept_bounded(&server_acceptor, stream, timeout, StreamKind::Data, "data")
+                        .await
+                        .is_err()
+                );
+            });
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client_connector = StreamConnector::SshAuth(secret_b);
+            assert!(
+                connect_bounded(
+                    &client_connector,
+                    SERVER_NAME_SOURCE,
+                    stream,
+                    timeout,
+                    StreamKind::Data,
+                    "data",
+                )
+                .await
+                .is_err()
+            );
+            server.await.unwrap();
+        }
+        // 2. Reflection attack (echoing server_tag back as client_tag) rejected by server
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_acceptor = StreamAcceptor::SshAuth(secret_a.clone());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Err(err) = accept_bounded(
+                    &server_acceptor,
+                    stream,
+                    timeout,
+                    StreamKind::Control,
+                    "control",
+                )
+                .await
+                else {
+                    panic!("reflection must fail");
+                };
+                assert!(
+                    format!("{err:#}").contains("tag mismatch"),
+                    "unexpected error: {err:#}"
+                );
+            });
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let mut hello = [0u8; 36];
+            hello[..4].copy_from_slice(&SSH_AUTH_MAGIC);
+            stream.write_all(&hello).await.unwrap();
+            let mut server_hello = [0u8; 64];
+            stream.read_exact(&mut server_hello).await.unwrap();
+            // reflect server's tag right back as client_tag
+            stream.write_all(&server_hello[32..64]).await.unwrap();
+            server.await.unwrap();
+        }
+        // 3. Cross-kind mismatch (client Control vs server Data) rejected
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_acceptor = StreamAcceptor::SshAuth(secret_a.clone());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                assert!(
+                    accept_bounded(&server_acceptor, stream, timeout, StreamKind::Data, "data")
+                        .await
+                        .is_err()
+                );
+            });
+            let stream = TcpStream::connect(addr).await.unwrap();
+            let client_connector = StreamConnector::SshAuth(secret_a.clone());
+            assert!(
+                connect_bounded(
+                    &client_connector,
+                    SERVER_NAME_SOURCE,
+                    stream,
+                    timeout,
+                    StreamKind::Control,
+                    "control",
+                )
+                .await
+                .is_err()
+            );
+            server.await.unwrap();
+        }
+        // 4. Stalled peer times out cleanly
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_acceptor = ControlStreamAcceptor::SshAuth(secret_a);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Err(err) = accept_control_bounded(
+                    &server_acceptor,
+                    stream,
+                    std::time::Duration::from_millis(100),
+                    "control",
+                )
+                .await
+                else {
+                    panic!("stalled peer must time out");
+                };
+                assert!(
+                    format!("{err:#}").contains("timed out"),
+                    "expected timeout error: {err:#}"
+                );
+            });
+            let _silent_client = TcpStream::connect(addr).await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_control_acceptor_dispatches_and_locks_resolved_data_mode() {
+        install_crypto_provider();
+        let server_cert = generate_self_signed_cert().unwrap();
+        let client_cert = generate_self_signed_cert().unwrap();
+        let secret = crate::protocol::SshAuthSecret::generate();
+        let server_auth = crate::protocol::PeerAuth::AutoTlsOrSshSecret {
+            peer_fingerprint: client_cert.fingerprint,
+            secret: secret.clone(),
+        };
+        let client_auth = crate::protocol::PeerAuth::AutoTlsOrSshSecret {
+            peer_fingerprint: server_cert.fingerprint,
+            secret,
+        };
+        let auto_acceptor =
+            ControlStreamAcceptor::from_peer_auth(Some(&server_cert), &server_auth).unwrap();
+        let tls_connector =
+            StreamConnector::from_peer_auth(Some(&client_cert), &client_auth, false).unwrap();
+        let ssh_connector =
+            StreamConnector::from_peer_auth(Some(&client_cert), &client_auth, true).unwrap();
+        let timeout = std::time::Duration::from_secs(5);
+        // Path 1: direct TCP connects with TLS -> control resolves to StreamAcceptor::Tls, which
+        // accepts TLS data and rejects SshAuth data
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = auto_acceptor.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (_send, _recv, data_acceptor) =
+                    accept_control_bounded(&acceptor, stream, timeout, "control")
+                        .await
+                        .unwrap();
+                assert!(matches!(data_acceptor, StreamAcceptor::Tls(_)));
+                let (bad_data, _) = listener.accept().await.unwrap();
+                assert!(
+                    accept_bounded(&data_acceptor, bad_data, timeout, StreamKind::Data, "data")
+                        .await
+                        .is_err(),
+                    "locked TLS data acceptor must reject SshAuth data connection"
+                );
+            });
+            let ctrl = TcpStream::connect(addr).await.unwrap();
+            let _ = connect_bounded(
+                &tls_connector,
+                SERVER_NAME_SOURCE,
+                ctrl,
+                timeout,
+                StreamKind::Control,
+                "control",
+            )
+            .await
+            .unwrap();
+            let bad_data = TcpStream::connect(addr).await.unwrap();
+            assert!(
+                connect_bounded(
+                    &ssh_connector,
+                    SERVER_NAME_SOURCE,
+                    bad_data,
+                    timeout,
+                    StreamKind::Data,
+                    "data",
+                )
+                .await
+                .is_err()
+            );
+            server.await.unwrap();
+        }
+        // Path 2: SSH fallback connects with SshAuth on loopback -> control resolves to
+        // StreamAcceptor::SshAuth, which accepts SshAuth data and rejects TLS data
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = auto_acceptor.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (_send, _recv, data_acceptor) =
+                    accept_control_bounded(&acceptor, stream, timeout, "control")
+                        .await
+                        .unwrap();
+                assert!(matches!(data_acceptor, StreamAcceptor::SshAuth(_)));
+                let (bad_data, _) = listener.accept().await.unwrap();
+                assert!(
+                    accept_bounded(&data_acceptor, bad_data, timeout, StreamKind::Data, "data")
+                        .await
+                        .is_err(),
+                    "locked SshAuth data acceptor must reject TLS data connection"
+                );
+            });
+            let ctrl = TcpStream::connect(addr).await.unwrap();
+            let _ = connect_bounded(
+                &ssh_connector,
+                SERVER_NAME_SOURCE,
+                ctrl,
+                timeout,
+                StreamKind::Control,
+                "control",
+            )
+            .await
+            .unwrap();
+            let bad_data = TcpStream::connect(addr).await.unwrap();
+            assert!(
+                connect_bounded(
+                    &tls_connector,
+                    SERVER_NAME_SOURCE,
+                    bad_data,
+                    timeout,
+                    StreamKind::Data,
+                    "data",
+                )
+                .await
+                .is_err()
+            );
+            server.await.unwrap();
+        }
+        // Path 3: Auto peek handles silent timeout, immediate EOF, and unexpected prefix byte
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = auto_acceptor.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Err(err) = accept_control_bounded(
+                    &acceptor,
+                    stream,
+                    std::time::Duration::from_millis(100),
+                    "control",
+                )
+                .await
+                else {
+                    panic!("silent Auto peer must time out during peek");
+                };
+                assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+            });
+            let _silent = TcpStream::connect(addr).await.unwrap();
+            server.await.unwrap();
+        }
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = auto_acceptor.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Err(err) = accept_control_bounded(&acceptor, stream, timeout, "control").await
+                else {
+                    panic!("EOF before first byte must fail");
+                };
+                assert!(
+                    format!("{err:#}").contains("before starting handshake"),
+                    "{err:#}"
+                );
+            });
+            let client = TcpStream::connect(addr).await.unwrap();
+            drop(client);
+            server.await.unwrap();
+        }
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = auto_acceptor;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let Err(err) = accept_control_bounded(&acceptor, stream, timeout, "control").await
+                else {
+                    panic!("unexpected first byte must fail");
+                };
+                assert!(format!("{err:#}").contains("0x00"), "{err:#}");
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&[0x00]).await.unwrap();
+            server.await.unwrap();
+        }
     }
 }

@@ -127,7 +127,7 @@ async fn remote_teardown_trace() -> anyhow::Result<()> {
             concurrency,
             default_admission,
             None,
-            None,
+            &remote::protocol::PeerAuth::None,
             &DestinationTransport::Direct,
             &master_control,
             None,

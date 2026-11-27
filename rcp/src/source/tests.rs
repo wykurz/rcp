@@ -93,16 +93,17 @@ async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result
                     source_path,
                     &destination,
                     common::config::DryRunMode::Brief,
-                    None,
+                    &remote::tls::ControlStreamAcceptor::Plaintext,
                     5,
                     &peer_connected,
                 );
                 let destination_operation = async {
                     let (mut send, mut receive) = remote::tls::connect_bounded(
-                        None,
+                        &remote::tls::StreamConnector::Plaintext,
                         remote::tls::SERVER_NAME_SOURCE,
                         peer,
                         std::time::Duration::from_secs(5),
+                        remote::tls::StreamKind::Control,
                         "dry-run test control",
                     )
                     .await?;
@@ -206,17 +207,18 @@ async fn dry_run_aborts_promptly_when_peer_control_drops_during_slow_preview() -
                 source.path(),
                 &destination,
                 common::config::DryRunMode::Brief,
-                None,
+                &remote::tls::ControlStreamAcceptor::Plaintext,
                 5,
                 &peer_connected,
             ),
         );
         let peer_drop = async move {
             let (_send, mut receive) = remote::tls::connect_bounded(
-                None,
+                &remote::tls::StreamConnector::Plaintext,
                 remote::tls::SERVER_NAME_SOURCE,
                 peer,
                 std::time::Duration::from_secs(5),
+                remote::tls::StreamKind::Control,
                 "dry-run drop test control",
             )
             .await
