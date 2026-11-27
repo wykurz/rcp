@@ -153,6 +153,11 @@ class PreparationFixture:
     def commands(self):
         return [argv[0] for argv, _ in self.calls]
 
+    def test_ext4_data_mounts_disable_access_time_updates(self):
+        self.prepare()
+        options = {Path(argv[-1]): set(argv[argv.index("-o") + 1].split(","))
+                   for argv, _ in self.calls if argv[0] == "mount" and "ext4" in argv}
+        self.assertEqual(options, {self.data / side: {"nodev", "nosuid", "noatime"} for side in storage.SIDES})
 
     def test_existing_mount_or_output_target_refuses_before_commands(self):
         for side in (*storage.SIDES, "output"):

@@ -846,8 +846,9 @@ timing in each order before interpreting small differences between builds.
 
 For the November 17/23 AWS comparison, use releases built from commits
 `a93b7fb81e1507d0ae45bfdf5b2a7a582a27cb10` and `eef155f935b8320627cc5bb7a531d60647a83de6` on the
-same 96-vCPU worker shape with separate ext4 RAID0 source and destination filesystems. Generate the
-`tiny-1k-10240k` fixture once with `filegen /mnt/source 10,10,10,10 1024 1000 --leaf-files` in a
+same 96-vCPU worker shape with separate ext4 RAID0 source and destination filesystems. Mount both
+with `relatime` to reproduce those historical runs. The AWS worker now requests `noatime`. Generate
+the `tiny-1k-10240k` fixture once with `filegen /mnt/source 10,10,10,10 1024 1000 --leaf-files` in a
 prepared source mount. It creates `/mnt/source/filegen` with 10,240,000 files of 1,000 bytes. First
 measure each release's defaults. A second comparison can pass `--local-copy-handoff=never` to hold
 that policy fixed on builds that support the option. Keep raw captures and calibration times in the
