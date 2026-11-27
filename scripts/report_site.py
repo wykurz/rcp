@@ -370,6 +370,9 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
     # and so does each kind of copy on other storage, with the first run that has a cell there
     others = [scenario for scenario in production_history.present(normalized)
               if scenario in (production_history.NFS, production_history.MEMORY)]
+    # how cp and rsync are measured is said with the first run that has a cell of one
+    reference = any(cell['scenario'] in production_history.REFERENCE_CELLS
+                    for value in normalized.values() for cell in value.get('cells', ()))
     navigation = lambda route: aws_navigation(route, status=status, remote=remote, others=[
         production_history.ROWS[other][:2] for other in others], tools=[
         production_history.ROWS[tool][:2] for tool in tools])
@@ -426,7 +429,7 @@ def render_aws_benchmarks(records, *, diagnostics=None, retained=False, status='
         "observed is in that run's appendix and its diagnostics JSON.</p>" +
         production_export.resource_diagnostics.configuration_html(
             observed[::-1], remote=remote, tools=bool(tools), elsewhere=bool(others),
-            sized=file_sets is not production_history.GENERATIONS[0], storage=storage) +
+            sized=file_sets is not production_history.GENERATIONS[0], storage=storage, reference=reference) +
         production_history.reading_html(
             remote, bool(tools), sized=file_sets is not production_history.GENERATIONS[0]))
     if len(setup_content.encode('utf-8')) > production_export.MAX_PUBLIC_HTML:

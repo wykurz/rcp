@@ -17,7 +17,7 @@ import sys
 
 from . import production_diagnostics as diagnostics
 from . import production_projection as projection
-from .common import require
+from .common import SUITE_PROFILES, require
 from .results import utc
 
 # newest qualified runs plotted for each file set
@@ -40,6 +40,13 @@ _tool_cells = lambda *kinds: {copies + "-" + tool: TOOL_TITLES[tool] + ", after 
 SCENARIOS = {LOCAL: "Local copy", REMOTE: "Remote copy over loopback", **_tool_cells(LOCAL, REMOTE),
              NFS: "Copy between NFS mounts", MEMORY: "Copy in memory", **_tool_cells(NFS, MEMORY)}
 TOOL_CELLS = frozenset(SCENARIOS) - set(COPIES)
+# the tools that copy a file set beside rcp for reference, with what each runs, and their cells:
+# each named after the copy cell it stands beside and its tool. cp does not copy from a host
+REFERENCE_TOOLS = {"cp": "cp -a", "rsync": "rsync -a"}
+REFERENCE_CELLS = {copies + "-" + tool: (copies, tool)
+                   for tool, beside in (("cp", (LOCAL, NFS, MEMORY)), ("rsync", COPIES)) for copies in beside}
+# their cells come last where cells are listed, as they came last
+SCENARIOS.update({cell: SCENARIOS[copies] + " by " + tool for cell, (copies, tool) in REFERENCE_CELLS.items()})
 # what has a trend of its own: each kind of copy, and each tool whichever copies it followed
 TRENDS = (*COPIES, *TOOLS)
 # what a tool does with a file set, after "files of … each"
@@ -321,6 +328,111 @@ def _points(value, extra, scenario, sets):
                 points[case][role + "_memory"] = _summary(
                     [item["max_rss_kib"] / 1024 for item in figures]) if ready else None
     return points, outside
+
+
+def references(value):
+    """What one qualified run says of the copies that other tools made beside rcp's, by file set and kind of copy.
+
+    An entry has what rcp took (`rcp`, the median of its `copies` in seconds) and, for each tool that
+    had a cell there, what that tool took: `seconds`, or the `limit` in seconds at which its copy was
+    cut off, or neither when the run did not measure it. The limit is the suite's `multiple` of
+    rcp's median: the runner gives a reference copy exactly that (benchmarks/matrix.py), and the
+    collector checked that this run was given the multiple of its suite. A file set whose copy by
+    rcp was not measured has no entry: there is nothing to stand beside.
+    """
+    if not value["benchmark_valid"]:
+        return {}
+    measured = {(item["case_id"], item.get("scenario")): item for item in value["measurements"]}
+    multiple = SUITE_PROFILES.get(value["identity"]["suite"], {}).get("reference_limit")
+    found = {}
+    for cell in value.get("cells", ()):
+        if cell["scenario"] not in REFERENCE_CELLS:
+            continue
+        copies, tool = REFERENCE_CELLS[cell["scenario"]]
+        beside = measured.get((cell["case_id"], copies))
+        if beside is None:
+            continue
+        entry = found.setdefault((cell["case_id"], copies), dict(
+            rcp=beside["median"], copies=len(beside["samples"]), multiple=multiple, tools={}))
+        item = measured.get((cell["case_id"], cell["scenario"]))
+        if item is not None:
+            entry["tools"][tool] = dict(seconds=item["median"])
+        elif cell["outcome"] == "timed_out" and cell["stage"] == "copy" and multiple is not None:
+            # a copy that ran into its limit: every other way of timing out is at another stage
+            entry["tools"][tool] = dict(limit=multiple * beside["median"])
+        else:
+            entry["tools"][tool] = {}
+    return found
+
+
+def _newest_references(records, companions, scenario):
+    """For each file set, what the newest qualified run that copied it with other tools says beside this kind of copy."""
+    newest = {}
+    for run_key, value in records.items():
+        for (case, copies), entry in references(value).items():
+            if copies != scenario:
+                continue
+            started = utc(value["timestamp"])
+            if case in newest and (newest[case]["at"], newest[case]["run_key"]) > (started.timestamp(), run_key):
+                continue
+            newest[case] = dict(entry, run_key=run_key, run=value["identity"]["run"], at=started.timestamp(),
+                                timestamp=started.isoformat().replace("+00:00", "Z"),
+                                day=f"{_day(started)} {started.year}",
+                                # which cp and which rsync, when the run's diagnostics name them
+                                versions=dict((companions.get(run_key) or {}).get("reference_tools") or {}))
+    return newest
+
+
+def against(seconds, rcp):
+    """Say how a tool's time stands against rcp's, to two figures."""
+    if rcp <= 0:
+        return ""
+    ratio = seconds / rcp
+    figure = f"{ratio:.0f}" if ratio >= 10 else f"{ratio:.2g}"
+    return "as long" if figure == "1" else figure + " times as long"
+
+
+def reference_figures(entry, tool):
+    """What a tool took beside rcp and how that stands against rcp, as two texts; None for a tool that was not measured."""
+    figures = entry["tools"][tool]
+    if "seconds" in figures:
+        return span(figures["seconds"]), against(figures["seconds"], entry["rcp"])
+    if "limit" in figures:
+        return "did not finish in " + span(figures["limit"]), f"more than {entry['multiple']:g} times as long"
+    return None
+
+
+def _other_tools(case, scenario, shown):
+    """The part of a file set's section that says what other tools took for this copy, beside rcp."""
+    page = "runs/" + escape(shown["run_key"], quote=True) + ".html"
+    tools = [tool for tool in REFERENCE_TOOLS if tool in shown["tools"]]
+    named = " and ".join("<code>" + tool + "</code>" for tool in tools)
+    what = ("What " + named + " took to pull this file set over SSH on the same loopback, after rcp. "
+            if scenario == REMOTE else
+            "What " + named + " took for this copy, between the same two mounts and after rcp. " if scenario == NFS else
+            "What " + named + " took for this copy, between the same two filesystems in memory and after rcp. "
+            if scenario == MEMORY else
+            "What " + named + " took for this copy, on the same machine and after rcp. ")
+    versions = [shown["versions"][tool] for tool in tools if tool in shown["versions"]]
+    html = ("<div class='reference'><h3 id='reference-" + case + "'>Other tools</h3><p>" + what +
+            "Measured once, for reference: run <a href='" + page + "'>" + escape(shown["run"]) + "</a> on "
+            "<time datetime='" + escape(shown["timestamp"], quote=True) + "'>" + escape(shown["day"]) + "</time>" +
+            (", with " + " and ".join("<code>" + escape(text) + "</code>" for text in versions) if versions else "") +
+            ".</p><div class='table-scroll'><table class='data'><thead><tr><th>Tool</th><th class='number'>Took</th>"
+            "<th>Against rcp</th></tr></thead><tbody><tr><td>rcp</td><td class='number'>" + span(shown["rcp"]) +
+            "</td><td></td></tr>")
+    for tool in tools:
+        figures = reference_figures(shown, tool)
+        took, beside = figures or ("not measured: see <a href='" + page + "#results'>the run</a>", "")
+        html += ("<tr><td><code>" + REFERENCE_TOOLS[tool] + "</code></td><td class='number'>" + took + "</td><td>" +
+                 beside + "</td></tr>")
+    count = {1: "one copy", 2: "two copies", 3: "three copies"}.get(shown["copies"], f"{shown['copies']} copies")
+    cut = any("limit" in figures for figures in shown["tools"].values())
+    return (html + "</tbody></table></div><p class='reading'>Each time is the median of that run's " + count +
+            " by the tool. " +
+            (f"A tool has {shown['multiple']:g} times what rcp took: a copy that takes longer is cut off and the tool "
+             "is not tried again. " if cut else "") +
+            "<a href='setups.html#reference'>How these were measured</a>.</p></div>")
 
 
 def _link(points):
@@ -645,7 +757,8 @@ def _local_only(case, tool):
     return any(case in sets.cases and tool in sets.local_only for sets in GENERATIONS)
 
 
-def _file_set(case, points, scenario):
+def _file_set(case, points, scenario, shown=None):
+    """One file set's section on the page of a scenario; `shown` is what other tools took for this copy, if any did."""
     shape = diagnostics.MATRIX_CASE_SHAPES[case]
     files = math.prod(shape["directory_widths"]) * shape["files_per_leaf"]
     how = ("copied locally by rcp with default settings" if scenario == LOCAL else
@@ -674,6 +787,8 @@ def _file_set(case, points, scenario):
                     escape(after) + "</code>" for name, before, after in item["changes"]) + "." +
                 (" The trend starts a new line here." if item["starts_segment"] else "") + "</li>")
         html += "</ul>"
+    if shown is not None:
+        html += _other_tools(case, scenario, shown)
     html += ("<details><summary>Data table</summary><div class='table-scroll'><table class='data'><thead><tr>"
         "<th>Run start (worker-reported)</th><th>Run</th><th>Commit</th><th>" + samples(scenario)[1].capitalize() +
         "</th>" +
@@ -698,9 +813,9 @@ def _file_set(case, points, scenario):
     return html + "</tbody></table></div></details></section>"
 
 
-def _render(cases, outside, limit, unmeasured, scenario, several, sets, earlier):
+def _render(cases, outside, limit, unmeasured, scenario, several, sets, earlier, shown):
     html = "<section id='history' aria-label='Performance history'>"
-    html += "".join(_file_set(case, points, scenario) for case, points in cases.items() if points)
+    html += "".join(_file_set(case, points, scenario, shown.get(case)) for case, points in cases.items() if points)
     empty = [NAMES[case] for case in unmeasured]
     if empty:
         # once there are two kinds of run, a file set without this kind may well have the other
@@ -721,7 +836,8 @@ def _render(cases, outside, limit, unmeasured, scenario, several, sets, earlier)
         html += ("<details class='earlier'><summary>Earlier file sets</summary><p class='window'>These file sets were "
                  "measured until the weekly suite replaced them with smaller ones, so that a command takes a "
                  "minute or two. Their numbers are not comparable with those above.</p>" +
-                 "".join(_file_set(case, points, scenario) for case, points in earlier.items()) + "</details>")
+                 "".join(_file_set(case, points, scenario, shown.get(case)) for case, points in earlier.items()) +
+                 "</details>")
     return html + "</section>"
 
 
@@ -784,8 +900,10 @@ def render(records, companions, scenario=LOCAL):
     earlier = {case: points for old in GENERATIONS[:GENERATIONS.index(sets)]
                for case, points in model(records, companions, scenario, old)[0].items()
                if points and case not in cases}
+    # what other tools took beside this kind of copy, which only a kind of copy has
+    shown = _newest_references(records, companions, scenario) if scenario in COPIES else {}
     return _fit({scenario: cases, EARLIER: earlier}, lambda windows, limit: _render(
-        windows[scenario], outside, limit, unmeasured, scenario, several, sets, windows[EARLIER]))
+        windows[scenario], outside, limit, unmeasured, scenario, several, sets, windows[EARLIER], shown))
 
 
 def _tile(case, points, scenario, page, beside, row=None):
@@ -858,7 +976,7 @@ def _storage_row(windows):
             "<div class='overview'>" + tiles + "</div></section>")
 
 
-def _overview(windows, limit, several, local, most_files):
+def _overview(windows, limit, several, local, most_files, reference=False):
     html = "<section id='history' aria-label='Copy duration of every file set'>"
     for scenario, cases in windows.items():
         if scenario in (NFS, MEMORY, *TOOLS):
@@ -888,6 +1006,9 @@ def _overview(windows, limit, several, local, most_files):
                  (" or of a tool's runs" if tools else "") + ", with a bar from the fastest "
                  "to the slowest" + ("" if tools else " copy") +
                  ". <a href='setups.html#reading'>How to read these plots</a>.</p>")
+    if reference:
+        html += ("<p class='window'>What <code>cp</code> and <code>rsync</code> take for the same copies was measured "
+                 "once, for reference: see the page of each kind of copy.</p>")
     if limit is not None:
         html += _window(limit, "list below")
     return html + "</section>"
@@ -909,8 +1030,12 @@ def overview(records, companions):
     # the other tools appear with the first run that has a cell of one, on the file set with the most files
     models.update({scenario: {sets.most_files: model(records, companions, scenario, sets)[0][sets.most_files]}
                    for scenario in shown if scenario in TOOLS})
+    # whether a page of a kind of copy says what other tools took for one of its file sets
+    reference = any(case in NAMES for scenario in shown if scenario in COPIES
+                    for case in _newest_references(records, companions, scenario))
     # a remote plot is compared with the local copy of its own run, whether or not that copy is still plotted
-    return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL], sets.most_files))
+    return _fit(models, lambda windows, limit: _overview(windows, limit, several, models[LOCAL], sets.most_files,
+                                                         reference))
 
 
 def storage_html(run, href, rows, sets):
@@ -997,7 +1122,8 @@ def time_use_html(use):
             ("" if use["complete"] else " Some of its steps recorded no phase, so the run took longer than that.") +
             "</p><div class='table-scroll'><table class='data'><thead><tr><th>Work</th><th class='number'>Time</th>"
             "<th colspan='2'>Share of the run</th></tr></thead>")
-    titles = {trend: row[0] for trend, row in ROWS.items()}
+    titles = dict({trend: row[0] for trend, row in ROWS.items()},
+                  **{tool: "Copies by " + tool for tool in REFERENCE_TOOLS})
     for heading, parts, names in (("Commands the run times", use["commands"], titles),
                                   ("Around them", use["around"], AROUND)):
         if not parts:
