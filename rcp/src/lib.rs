@@ -180,8 +180,10 @@
 //! See the module documentation for details.
 
 // Library for shared code between rcp and rcpd binaries
+pub mod daemon_session;
 pub mod destination;
 mod directory_tracker;
+pub mod master_session;
 pub mod path;
 mod receiver_shutdown;
 pub mod source;
