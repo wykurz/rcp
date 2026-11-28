@@ -1,5 +1,5 @@
-//! A no-op [`Controller`](crate::Controller) that never limits (always emits
-//! [`Decision::UNLIMITED`](crate::Decision::UNLIMITED)) — the explicit unlimited baseline used by the
+//! A no-op [`Controller`] that never limits (always emits [`Decision::UNLIMITED`]) — the explicit
+//! unlimited baseline used by the
 //! simulator and the controller conformance tests.
 
 use crate::controller::{Controller, Decision, Sample};

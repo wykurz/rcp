@@ -1629,8 +1629,7 @@ async fn dry_run_dst_exists(dst_path: &std::path::Path) -> Result<bool, Error> {
 /// Copy a regular file fd-relative: create (or overwrite) the destination via `dst_parent`,
 /// copy the bytes with `copy_file_data`, then apply metadata through the destination's own
 /// fd — the open is held from creation through metadata, closing the path-based re-open TOCTOU
-/// window. `--overwrite`/`--ignore-existing`/`is_fresh`/dry-run semantics mirror the path-based
-/// [`copy_file`].
+/// window.
 #[allow(clippy::too_many_arguments)]
 async fn copy_file_fd(
     prog_track: &'static progress::Progress,

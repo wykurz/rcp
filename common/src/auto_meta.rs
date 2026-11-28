@@ -1,6 +1,6 @@
 //! Pure decision-to-enforcement glue for the adaptive metadata throttle.
 //!
-//! The auto-meta adapter task (spawned in [`crate::spawn_auto_meta_throttle`])
+//! The auto-meta adapter task (spawned by `spawn_auto_meta_throttle` in [`crate::runtime_setup`])
 //! watches a [`congestion::Decision`] stream and applies each new decision to
 //! the [`throttle`] enforcement layer. The state machine that diffs
 //! consecutive decisions and picks the right throttle calls lives here as a
@@ -28,7 +28,7 @@ pub(crate) enum AdapterAction {
 
 /// Assumed replenish-interval when converting ops/sec -> per-interval
 /// token count. 100ms matches the common case produced by
-/// [`crate::get_replenish_interval`] when `ops_throttle > 100` and keeps
+/// `get_replenish_interval` in [`crate::runtime_setup`] when `ops_throttle > 100` and keeps
 /// the rate conversion simple and consistent across the adapter.
 const REPLENISH_INTERVAL_SECS: f64 = 0.1;
 
@@ -56,7 +56,7 @@ pub(crate) const DROP_REPORT_INTERVAL: std::time::Duration = std::time::Duration
 /// fighting over the global rate gate.
 ///
 /// Lives in this module (rather than inline in
-/// [`crate::spawn_auto_meta_throttle`]) so unit tests can drive it
+/// `spawn_auto_meta_throttle` in [`crate::runtime_setup`]) so unit tests can drive it
 /// directly on the current tokio runtime without spawning a dedicated
 /// one or touching tool-level setup.
 pub(crate) async fn run_adapter(

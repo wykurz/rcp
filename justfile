@@ -250,9 +250,10 @@ report-tables-check:
 analysis-test:
     python3 -m unittest discover -s analysis/2026-10-11 -p 'test_*.py'
 
-# Build and check documentation
+# Build and check documentation, private items included: a module comment is where the
+# implementation is explained, and the names it links are checked only where it is built
 doc:
-    RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" ./scripts/cargo-host.sh doc --no-deps --workspace
+    RUSTDOCFLAGS="--cfg tokio_unstable -D warnings" ./scripts/cargo-host.sh doc --no-deps --workspace --document-private-items
 
 # Run the standard CI checks locally before pushing (lint, docs, tests + Docker).
 # The MSRV check is intentionally separate — run `just msrv` (it needs the nix
