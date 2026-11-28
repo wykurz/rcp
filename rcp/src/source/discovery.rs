@@ -988,7 +988,7 @@ async fn directory_body(
                 continue;
             }
             if !observation.included {
-                observation.kind.inc_skipped(super::progress());
+                observation.kind.inc_skipped(&super::progress());
                 continue;
             }
             if observation.kind == EntryKind::Special {
@@ -1124,7 +1124,7 @@ async fn discover(context: Arc<DiscoveryContext>, root: SrcDst) -> anyhow::Resul
     let included = observation.included;
     let has_root_item = included && observation.kind != EntryKind::Special;
     if !included {
-        observation.kind.inc_skipped(super::progress());
+        observation.kind.inc_skipped(&super::progress());
     } else {
         match observation.kind {
             EntryKind::Dir => {

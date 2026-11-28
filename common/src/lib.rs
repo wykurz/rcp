@@ -265,9 +265,62 @@ fn signal_logger_cancel() {
     }
 }
 
+/// Handle to the active [`progress::Progress`] counters (either the process-global instance or an
+/// isolated task-scoped instance created via [`task_scope::scope_progress`]).
+#[derive(Clone)]
+pub struct ProgressRef(ProgressRefInner);
+
+#[derive(Clone)]
+enum ProgressRefInner {
+    Global(&'static progress::Progress),
+    Scoped(std::sync::Arc<progress::Progress>),
+}
+
+impl From<&'static progress::Progress> for ProgressRef {
+    fn from(progress: &'static progress::Progress) -> Self {
+        Self(ProgressRefInner::Global(progress))
+    }
+}
+
+impl From<&'static std::sync::LazyLock<progress::Progress>> for ProgressRef {
+    fn from(progress: &'static std::sync::LazyLock<progress::Progress>) -> Self {
+        Self(ProgressRefInner::Global(progress))
+    }
+}
+
+impl std::fmt::Debug for ProgressRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            ProgressRefInner::Global(_) => formatter.write_str("ProgressRef::Global(..)"),
+            ProgressRefInner::Scoped(_) => formatter.write_str("ProgressRef::Scoped(..)"),
+        }
+    }
+}
+
+impl std::ops::Deref for ProgressRef {
+    type Target = progress::Progress;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            ProgressRefInner::Global(progress) => progress,
+            ProgressRefInner::Scoped(progress) => progress,
+        }
+    }
+}
+
 #[must_use]
 pub fn get_progress() -> &'static progress::Progress {
     &PROGRESS
+}
+
+/// Returns the active task-scoped [`progress::Progress`] if running inside
+/// [`task_scope::scope_progress`], falling back to the process-global instance.
+#[must_use]
+pub fn current_progress() -> ProgressRef {
+    match task_scope::scoped_progress() {
+        Some(progress) => ProgressRef(ProgressRefInner::Scoped(progress)),
+        None => ProgressRef(ProgressRefInner::Global(&PROGRESS)),
+    }
 }
 
 /// stores remote runtime stats for display at the end of a remote copy operation

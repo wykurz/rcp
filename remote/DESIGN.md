@@ -61,6 +61,7 @@ Keep these boundaries intact when changing the component:
 | Protocol compatibility and build identity                        | [`src/version.rs`](src/version.rs), [`build.rs`](build.rs)                |
 | Serialized messages and daemon configuration                     | [`src/protocol`](src/protocol)                                            |
 | Framing and TLS                                                  | [`src/streams.rs`](src/streams.rs), [`src/tls.rs`](src/tls.rs)            |
+| Pluggable source↔destination transport seam                      | [`src/transport.rs`](src/transport.rs)                                    |
 | Master orchestration and daemon entry point                      | [`rcp`](../rcp/src/bin/rcp.rs), [`rcpd`](../rcp/src/bin/rcpd.rs)          |
 | Traversal, admission, and destination writes                     | [`source`](../rcp/src/source), [`destination`](../rcp/src/destination.rs) |
 

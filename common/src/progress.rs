@@ -36,15 +36,21 @@ thread_local! {
 /// Each counter uses NUM_SHARDS × 128 bytes = 8KB (with 64 shards).
 /// This is larger than a simple AtomicU64 but virtually eliminates contention.
 pub struct TlsCounter {
-    shards: [PaddedAtomicU64; NUM_SHARDS],
+    // heap-allocated so constructing a Progress (22 counters = ~176 KiB) never blows small
+    // thread stacks in debug/musl builds while keeping all 64 128-byte-aligned shards contiguous
+    shards: Box<[PaddedAtomicU64; NUM_SHARDS]>,
 }
 
 impl TlsCounter {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            shards: std::array::from_fn(|_| PaddedAtomicU64(std::sync::atomic::AtomicU64::new(0))),
-        }
+        let shards: Box<[PaddedAtomicU64; NUM_SHARDS]> = (0..NUM_SHARDS)
+            .map(|_| PaddedAtomicU64(std::sync::atomic::AtomicU64::new(0)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("shard vec has NUM_SHARDS elements"));
+        Self { shards }
     }
 
     pub fn add(&self, value: u64) {

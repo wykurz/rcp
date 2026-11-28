@@ -58,6 +58,8 @@
 #     legitimately set. The rest of the funnel file is NOT exempt from rule 1.
 #   * remote/src/tls.rs (rule 2 only) — its connects/accepts are all inside #[cfg(test)]
 #     handshake fixtures, which exercise TLS over a throwaway socket and carry no copy.
+#   * rcp/src/source/discovery/tests/trace_teardown.rs (rule 2 only) — a #[cfg(test)]-only
+#     TLA+ teardown trace fixture using simulated turmoil::net sockets (no OS sockets).
 #
 # The check also fails when a pattern is missing from the funnel entirely: without that, a
 # rename or a deleted option would make the whole check pass vacuously.
@@ -108,7 +110,7 @@ ALIASES="set_nodelay( set_keepalive("
 # rule 2: establishing or accepting a connection, or creating a socket to connect later, is
 # confined to the funnel file's helpers
 CONNECT_PATTERNS="TcpStream::connect( TcpStream::connect_timeout( .accept() .poll_accept( Socket::new( Socket::new_raw( TcpSocket::new_v4( TcpSocket::new_v6("
-CONNECT_EXEMPT="${TCP_CHECK_CONNECT_EXEMPT:-remote/src/tls.rs}"
+CONNECT_EXEMPT="${TCP_CHECK_CONNECT_EXEMPT:-remote/src/tls.rs rcp/src/source/discovery/tests/trace_teardown.rs}"
 
 VIOLATIONS_FOUND=0
 
@@ -174,7 +176,9 @@ fi
 # Outside the funnel file (and the tls.rs exemption), raw connects/accepts are forbidden
 # entirely. Line comments are stripped first, so prose naming a connect is fine.
 while IFS= read -r file; do
-    [ "$file" = "$CONNECT_EXEMPT" ] && continue
+    case " $CONNECT_EXEMPT " in
+        *" $file "*) continue ;;
+    esac
     [ "$file" = "$FUNNEL_FILE" ] && continue
     code=$(sed 's://.*::' "$file")
     all_hits=""

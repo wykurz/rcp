@@ -738,7 +738,7 @@ impl DirectoryFinalization {
         }
         // increment counter now (if we created it)
         if was_created {
-            common::get_progress().directories_created.inc();
+            common::current_progress().directories_created.inc();
         }
         // apply stored metadata through the directory's OWN held fd (fd-relative).
         // for a reused directory locked down under strict mode, put back the ACLs the

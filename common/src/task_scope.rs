@@ -84,6 +84,20 @@ impl Drop for TrackedTask {
 
 tokio::task_local! {
     static TASK_TRACKER: TaskTracker;
+    static PROGRESS_SCOPE: Arc<crate::progress::Progress>;
+}
+
+/// Runs an operation with a task-scoped [`crate::progress::Progress`] instance that propagates
+/// across [`spawn_tracked`] descendants without touching the process-global counters.
+pub async fn scope_progress<F>(progress: Arc<crate::progress::Progress>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    PROGRESS_SCOPE.scope(progress, future).await
+}
+
+pub(crate) fn scoped_progress() -> Option<Arc<crate::progress::Progress>> {
+    PROGRESS_SCOPE.try_with(Arc::clone).ok()
 }
 
 /// Runs an operation in a task scope and waits for cancelled descendants to finish dropping.
@@ -110,11 +124,52 @@ where
         .try_with(Clone::clone)
         .expect("tracked work must run inside a task scope");
     let tracked = tracker.enter();
-    join_set.spawn(TASK_TRACKER.scope(
+    let scoped = TASK_TRACKER.scope(
         tracker,
         TrackedFuture {
             future,
             _tracked: tracked,
         },
-    ));
+    );
+    if let Ok(progress) = PROGRESS_SCOPE.try_with(Arc::clone) {
+        join_set.spawn(PROGRESS_SCOPE.scope(progress, scoped));
+    } else {
+        join_set.spawn(scoped);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scope_progress_isolates_counters_across_spawn_tracked() {
+        let global_before = crate::get_progress().files_copied.get();
+        let a = Arc::new(crate::progress::Progress::new());
+        let b = Arc::new(crate::progress::Progress::new());
+        let run_endpoint = |prog: Arc<crate::progress::Progress>, count: u64| async move {
+            scope_progress(prog, async move {
+                scope_tasks(async move {
+                    let mut set = tokio::task::JoinSet::new();
+                    for _ in 0..count {
+                        spawn_tracked(&mut set, async move {
+                            crate::current_progress().files_copied.inc();
+                        });
+                    }
+                    while let Some(res) = set.join_next().await {
+                        res.unwrap();
+                    }
+                })
+                .await;
+            })
+            .await;
+        };
+        tokio::join!(
+            run_endpoint(Arc::clone(&a), 3),
+            run_endpoint(Arc::clone(&b), 5)
+        );
+        assert_eq!(a.files_copied.get(), 3);
+        assert_eq!(b.files_copied.get(), 5);
+        assert_eq!(crate::get_progress().files_copied.get(), global_before);
+    }
 }

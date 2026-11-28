@@ -120,6 +120,7 @@
 //! - [`streams`] - Async stream wrappers with typed message passing
 //! - [`tls`] - TLS certificate generation and configuration
 //! - [`tracelog`] - Remote tracing and progress aggregation
+//! - [`transport`] - Pluggable control/data transport abstraction over configured TCP
 
 #[cfg(not(tokio_unstable))]
 compile_error!("tokio_unstable cfg must be enabled; see .cargo/config.toml");
@@ -1707,6 +1708,7 @@ pub mod stdio;
 pub mod streams;
 pub mod tls;
 pub mod tracelog;
+pub mod transport;
 pub mod version;
 
 /// Network profile for TCP configuration tuning

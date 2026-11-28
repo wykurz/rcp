@@ -12,8 +12,8 @@ use std::os::fd::AsFd as _;
 use std::sync::Arc;
 use tracing::{Instrument, instrument};
 
-fn progress() -> &'static common::progress::Progress {
-    common::get_progress()
+fn progress() -> common::ProgressRef {
+    common::current_progress()
 }
 
 /// Open the trusted parent prefix of a root operand and return it as a hardened `Dir` plus the
@@ -251,7 +251,7 @@ impl AcceptingSendStreamPool {
     /// Every accepted stream keeps its payload buffer between files, up to the configured
     /// retention limit.
     fn new(
-        data_listener: tokio::net::TcpListener,
+        data_listener: Box<dyn remote::transport::TransportListener>,
         pool_size: usize,
         tcp_config: &remote::TcpConfig,
         stream_acceptor: remote::tls::StreamAcceptor,
@@ -277,11 +277,13 @@ impl AcceptingSendStreamPool {
             // wrap the main loop so we can handle shutdown
             tokio::select! {
                 result = async {
+                    let mut accept_fut = data_listener.accept_data(profile, keepalive_sec);
                     loop {
                         tokio::select! {
-                            // accept new connections from destination (the helper applies the
-                            // Data socket options — no TCP_USER_TIMEOUT, see configure_tcp_socket)
-                            result = remote::accept_tcp_data(&data_listener, profile, keepalive_sec) => {
+                            // accept new connections from destination (the transport applies Data
+                            // socket options — no TCP_USER_TIMEOUT, see configure_tcp_socket)
+                            result = &mut accept_fut => {
+                                accept_fut = data_listener.accept_data(profile, keepalive_sec);
                                 match result {
                                     Ok((stream, addr)) => {
                                         tracing::debug!("Accepted data connection from {}", addr);
@@ -405,8 +407,8 @@ impl Drop for PooledAcceptedSendStream {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    control_stream: tokio::net::TcpStream,
-    data_listener: tokio::net::TcpListener,
+    control_stream: remote::transport::BoxedTransportStream,
+    data_listener: Box<dyn remote::transport::TransportListener>,
     settings: &common::copy::Settings,
     capture: ExtendedMetadataCapture,
     src: &std::path::Path,
@@ -1176,7 +1178,7 @@ async fn maybe_run_dry_run_progress_hook() {
 /// Destination completes after receiving the empty discovery marker.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dry_run_connection(
-    stream: tokio::net::TcpStream,
+    stream: remote::transport::BoxedTransportStream,
     settings: &common::copy::Settings,
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -1368,7 +1370,6 @@ async fn handle_dry_run_connection(
     }
 }
 
-#[instrument(skip(master_control, cert_key))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_source(
     master_control: &remote::stdio::DaemonControlSender,
@@ -1388,14 +1389,55 @@ pub async fn run_source(
     peer_auth: &remote::protocol::PeerAuth,
     peer_connected: &std::sync::atomic::AtomicBool,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
+    // box the forwarding call so debug callers do not pay two nested copies of the source
+    // state machine on the stack
+    Box::pin(run_source_with_transport(
+        master_control,
+        src,
+        dst,
+        settings,
+        capture,
+        tcp_config,
+        concurrency,
+        admission,
+        files_source,
+        bind_ip,
+        accept_timeout,
+        cert_key,
+        peer_auth,
+        peer_connected,
+        remote::transport::tcp(),
+    ))
+    .await
+}
+
+#[instrument(name = "run_source", skip(master_control, cert_key, transport))]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_source_with_transport(
+    master_control: &remote::stdio::DaemonControlSender,
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    settings: &common::copy::Settings,
+    capture: ExtendedMetadataCapture,
+    tcp_config: &remote::TcpConfig,
+    concurrency: remote::ResolvedRemoteConcurrency,
+    admission: common::EndpointAdmission,
+    files_source: common::FilesInFlightSource,
+    bind_ip: Option<&str>,
+    accept_timeout: std::time::Duration,
+    cert_key: Option<&remote::tls::CertifiedKey>,
+    peer_auth: &remote::protocol::PeerAuth,
+    peer_connected: &std::sync::atomic::AtomicBool,
+    transport: Arc<dyn remote::transport::Transport>,
+) -> anyhow::Result<(String, common::copy::Summary)> {
     let control_acceptor = remote::tls::ControlStreamAcceptor::from_peer_auth(cert_key, peer_auth)?;
     tracing::info!("Source stream security: {}", control_acceptor.description());
-    // create TCP listeners for control and data connections
-    let control_listener = remote::create_tcp_control_listener(tcp_config, bind_ip).await?;
-    let data_listener = remote::create_tcp_data_listener(tcp_config, bind_ip).await?;
-    let control_addr = remote::get_tcp_listener_addr(&control_listener, bind_ip)?;
-    let data_addr = remote::get_tcp_listener_addr(&data_listener, bind_ip)?;
-    let tunnel_target_ip = remote::get_tcp_listener_tunnel_target_ip(&control_listener)?;
+    // create listeners for control and data connections
+    let control_listener = transport.bind_control(tcp_config, bind_ip).await?;
+    let data_listener = transport.bind_data(tcp_config, bind_ip).await?;
+    let control_addr = control_listener.advertised_addr(bind_ip)?;
+    let data_addr = data_listener.advertised_addr(bind_ip)?;
+    let tunnel_target_ip = control_listener.tunnel_target_ip()?;
     tracing::info!(
         "Source TCP listeners: control={}, data={}, tunnel_target_ip={}",
         control_addr,
@@ -1416,14 +1458,9 @@ pub async fn run_source(
     tracing::info!("Waiting for connection from destination");
     // wait for destination to connect with a timeout
     let error_collector = std::sync::Arc::new(common::error_collector::ErrorCollector::default());
-    // the accept helper applies the Control socket options before returning, so the dry-run path
-    // below gets the same configuration as the normal one
-    match tokio::time::timeout(
-        accept_timeout,
-        remote::accept_tcp_control(&control_listener, tcp_config),
-    )
-    .await
-    {
+    // the transport applies Control socket options before returning, so the dry-run path below
+    // gets the same configuration as the normal one
+    match tokio::time::timeout(accept_timeout, control_listener.accept_control(tcp_config)).await {
         Ok(Ok((stream, addr))) => {
             tracing::info!("Destination control connection from {}", addr);
             // in dry-run mode, do simplified flow: traverse, log, and tell destination we're done
@@ -1478,11 +1515,12 @@ pub async fn run_source(
     tracing::info!("Source is done");
     // destination is authoritative for copy/unchanged/removed counts, but
     // skip counts are source-side only (destination never encounters skipped items)
+    let prog = progress();
     let summary = common::copy::Summary {
-        files_skipped: progress().files_skipped.get() as usize,
-        symlinks_skipped: progress().symlinks_skipped.get() as usize,
-        directories_skipped: progress().directories_skipped.get() as usize,
-        specials_skipped: progress().specials_skipped.get() as usize,
+        files_skipped: prog.files_skipped.get() as usize,
+        symlinks_skipped: prog.symlinks_skipped.get() as usize,
+        directories_skipped: prog.directories_skipped.get() as usize,
+        specials_skipped: prog.specials_skipped.get() as usize,
         ..Default::default()
     };
     match error_collector.take_error() {

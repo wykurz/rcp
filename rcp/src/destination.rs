@@ -14,8 +14,8 @@ mod resources;
 #[cfg(test)]
 mod testutils;
 
-fn progress() -> &'static common::progress::Progress {
-    common::get_progress()
+fn progress() -> common::ProgressRef {
+    common::current_progress()
 }
 
 struct FileDestination<'a> {
@@ -135,6 +135,7 @@ struct DataConnectionPool {
     conn_timeout: std::time::Duration,
     shutdown: ReceiverShutdown,
     peer_connected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    transport: Arc<dyn remote::transport::Transport>,
 }
 
 impl DataConnectionPool {
@@ -156,7 +157,12 @@ impl DataConnectionPool {
             conn_timeout: std::time::Duration::from_secs(tcp_config.conn_timeout_sec),
             shutdown,
             peer_connected: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            transport: remote::transport::tcp(),
         }
+    }
+    fn with_transport(mut self, transport: Arc<dyn remote::transport::Transport>) -> Self {
+        self.transport = transport;
+        self
     }
     fn with_peer_connected(
         mut self,
@@ -204,8 +210,10 @@ impl DataConnectionPool {
             .next_addr
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let data_addr = self.data_addrs[index % self.data_addrs.len()];
-        let stream =
-            remote::connect_tcp_data(data_addr, self.network_profile, self.keepalive_sec).await?;
+        let stream = self
+            .transport
+            .connect_data(data_addr, self.network_profile, self.keepalive_sec)
+            .await?;
         let (_send_stream, recv_stream) = remote::tls::connect_bounded(
             &self.stream_connector,
             remote::tls::SERVER_NAME_SOURCE,
@@ -1367,7 +1375,8 @@ async fn prepare_and_announce_directory(
     lookup_concurrency: std::num::NonZeroUsize,
     credit: Option<Arc<resources::DirectoryLease>>,
 ) -> anyhow::Result<()> {
-    let _ops_guard = progress().ops.guard();
+    let prog = progress();
+    let _ops_guard = prog.ops.guard();
     let parent = if is_root {
         None
     } else {
@@ -1950,7 +1959,7 @@ pub struct SshFallbackEndpoints {
 }
 
 struct ConnectedDestinationTransport {
-    control_stream: tokio::net::TcpStream,
+    control_stream: remote::transport::BoxedTransportStream,
     data_addrs: Vec<std::net::SocketAddr>,
     ssh_tunnels: Option<remote::ssh_tunnel::SshTunnelSet>,
     via_ssh_tunnel: bool,
@@ -1967,6 +1976,7 @@ async fn connect_destination_transport(
     master_control: &remote::stdio::DaemonControlSender,
     fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
     cleanup: &remote::RemoteCleanup,
+    transport_layer: &dyn remote::transport::Transport,
 ) -> anyhow::Result<ConnectedDestinationTransport> {
     match transport {
         remote::protocol::DestinationTransport::Direct => {
@@ -1975,7 +1985,9 @@ async fn connect_destination_transport(
                 src_control_addr,
                 src_data_addrs
             );
-            let control_stream = remote::connect_tcp_control(*src_control_addr, tcp_config).await?;
+            let control_stream = transport_layer
+                .connect_control(*src_control_addr, tcp_config)
+                .await?;
             Ok(ConnectedDestinationTransport {
                 control_stream,
                 data_addrs: src_data_addrs.to_vec(),
@@ -1989,7 +2001,9 @@ async fn connect_destination_transport(
                 src_control_addr,
                 src_data_addrs
             );
-            let control_stream = remote::connect_tcp_control(*src_control_addr, tcp_config).await?;
+            let control_stream = transport_layer
+                .connect_control(*src_control_addr, tcp_config)
+                .await?;
             Ok(ConnectedDestinationTransport {
                 control_stream,
                 data_addrs: src_data_addrs.to_vec(),
@@ -2004,12 +2018,9 @@ async fn connect_destination_transport(
                 src_control_addr,
                 probe_timeout.as_secs()
             );
-            match remote::connect_tcp_control_with_timeout(
-                *src_control_addr,
-                tcp_config,
-                probe_timeout,
-            )
-            .await
+            match transport_layer
+                .connect_control_with_timeout(*src_control_addr, tcp_config, probe_timeout)
+                .await
             {
                 Ok(control_stream) => Ok(ConnectedDestinationTransport {
                     control_stream,
@@ -2040,8 +2051,9 @@ async fn connect_destination_transport(
                         endpoints.control_addr,
                         endpoints.data_addrs
                     );
-                    let control_stream =
-                        remote::connect_tcp_control(endpoints.control_addr, tcp_config).await?;
+                    let control_stream = transport_layer
+                        .connect_control(endpoints.control_addr, tcp_config)
+                        .await?;
                     Ok(ConnectedDestinationTransport {
                         control_stream,
                         data_addrs: endpoints.data_addrs,
@@ -2072,6 +2084,7 @@ async fn connect_destination_transport(
                 dest_root,
                 tcp_config,
                 cleanup,
+                transport_layer,
                 None,
             )
             .await
@@ -2091,12 +2104,9 @@ async fn connect_destination_transport(
                 src_control_addr,
                 probe_timeout.as_secs()
             );
-            match remote::connect_tcp_control_with_timeout(
-                *src_control_addr,
-                tcp_config,
-                probe_timeout,
-            )
-            .await
+            match transport_layer
+                .connect_control_with_timeout(*src_control_addr, tcp_config, probe_timeout)
+                .await
             {
                 Ok(control_stream) => Ok(ConnectedDestinationTransport {
                     control_stream,
@@ -2123,6 +2133,7 @@ async fn connect_destination_transport(
                         dest_root,
                         tcp_config,
                         cleanup,
+                        transport_layer,
                         Some(&reason),
                     )
                     .await
@@ -2146,6 +2157,7 @@ async fn connect_direct_ssh_tunnels(
     dest_root: &std::path::Path,
     tcp_config: &remote::TcpConfig,
     cleanup: &remote::RemoteCleanup,
+    transport_layer: &dyn remote::transport::Transport,
     fallback_reason: Option<&str>,
 ) -> anyhow::Result<ConnectedDestinationTransport> {
     let target_control = std::net::SocketAddr::new(tunnel_target_ip, control_port);
@@ -2197,7 +2209,10 @@ async fn connect_direct_ssh_tunnels(
     }
     let control_addr = tunnels.control_addr();
     let data_addrs = tunnels.data_addrs().to_vec();
-    let control_stream = match remote::connect_tcp_control(control_addr, tcp_config).await {
+    let control_stream = match transport_layer
+        .connect_control(control_addr, tcp_config)
+        .await
+    {
         Ok(stream) => stream,
         Err(error) => {
             tunnels.close().await;
@@ -2212,9 +2227,57 @@ async fn connect_direct_ssh_tunnels(
     })
 }
 
-#[instrument(skip(cert_key, master_control, fallback_rx, cleanup))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_destination(
+    src_control_addr: &std::net::SocketAddr,
+    src_data_addrs: &[std::net::SocketAddr],
+    src_server_name: &str,
+    settings: &common::copy::Settings,
+    dry_run: bool,
+    overwrite_manifest_max_entries: usize,
+    preserve: &common::preserve::Settings,
+    tcp_config: &remote::TcpConfig,
+    concurrency: remote::ResolvedRemoteConcurrency,
+    admission: common::EndpointAdmission,
+    cert_key: Option<&remote::tls::CertifiedKey>,
+    peer_auth: &remote::protocol::PeerAuth,
+    transport: &remote::protocol::DestinationTransport,
+    master_control: &remote::stdio::DaemonControlSender,
+    fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
+    cleanup: &remote::RemoteCleanup,
+    peer_connected: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<(String, common::copy::Summary)> {
+    // box the forwarding call so debug callers do not pay two nested copies of the destination
+    // state machine on the stack
+    Box::pin(run_destination_with_transport(
+        src_control_addr,
+        src_data_addrs,
+        src_server_name,
+        settings,
+        dry_run,
+        overwrite_manifest_max_entries,
+        preserve,
+        tcp_config,
+        concurrency,
+        admission,
+        cert_key,
+        peer_auth,
+        transport,
+        master_control,
+        fallback_rx,
+        cleanup,
+        peer_connected,
+        remote::transport::tcp(),
+    ))
+    .await
+}
+
+#[instrument(
+    name = "run_destination",
+    skip(cert_key, master_control, fallback_rx, cleanup, transport_layer)
+)]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_destination_with_transport(
     src_control_addr: &std::net::SocketAddr,
     src_data_addrs: &[std::net::SocketAddr],
     _src_server_name: &str,
@@ -2232,6 +2295,7 @@ pub async fn run_destination(
     fallback_rx: Option<tokio::sync::oneshot::Receiver<SshFallbackEndpoints>>,
     cleanup: &remote::RemoteCleanup,
     peer_connected: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    transport_layer: Arc<dyn remote::transport::Transport>,
 ) -> anyhow::Result<(String, common::copy::Summary)> {
     let admitted_ssh_tunnels = match admission {
         common::EndpointAdmission::Remote(resources) if resources.ssh_tunnels > 0 => {
@@ -2269,6 +2333,7 @@ pub async fn run_destination(
         master_control,
         fallback_rx,
         cleanup,
+        transport_layer.as_ref(),
     )
     .await?;
     let attach_ssh_control_hint = |error: anyhow::Error| {
@@ -2341,6 +2406,7 @@ pub async fn run_destination(
                 stream_connector,
                 directory_tracker.shutdown().clone(),
             )
+            .with_transport(transport_layer)
             .with_peer_connected(peer_connected.clone()),
         );
         // one operation-level indirection bounds the nested receiver layout in rcpd's watchdog
@@ -6124,6 +6190,7 @@ mod ssh_transport_tests {
             &control_tx,
             Some(fallback_rx),
             &cleanup,
+            remote::transport::tcp().as_ref(),
         )
         .await
         .unwrap();

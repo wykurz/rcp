@@ -2609,7 +2609,7 @@ pub(crate) async fn resolve_dst_dir(
 }
 
 async fn remove_existing_non_directory(
-    prog_track: &'static progress::Progress,
+    prog_track: &progress::Progress,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst_path: &std::path::Path,
@@ -2669,7 +2669,7 @@ async fn remove_existing_non_directory(
 /// Overwrite comparison/filter decisions and direct-leaf removal counters therefore describe the
 /// planning snapshot; a compatible replacement is not re-evaluated before the by-name syscall.
 pub async fn remove_existing(
-    prog_track: &'static progress::Progress,
+    prog_track: impl Into<crate::ProgressRef>,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst_path: &std::path::Path,
@@ -2677,7 +2677,7 @@ pub async fn remove_existing(
     settings: &Settings,
 ) -> Result<RmSummary, Error> {
     remove_existing_guarded(
-        prog_track,
+        prog_track.into(),
         dst_parent,
         dst_name,
         dst_path,
@@ -2689,7 +2689,7 @@ pub async fn remove_existing(
 }
 
 pub(crate) async fn remove_existing_guarded(
-    prog_track: &'static progress::Progress,
+    prog_track: impl Into<crate::ProgressRef>,
     dst_parent: &Arc<Dir>,
     dst_name: &OsStr,
     dst_path: &std::path::Path,
@@ -2697,6 +2697,7 @@ pub(crate) async fn remove_existing_guarded(
     settings: &Settings,
     protection: Option<&Arc<crate::input_protection::InputProtection>>,
 ) -> Result<RmSummary, Error> {
+    let prog_track = prog_track.into();
     if dst_snapshot.kind() == EntryKind::Dir
         && let Some(protection) = protection
     {
@@ -2711,7 +2712,7 @@ pub(crate) async fn remove_existing_guarded(
     match dst_snapshot.kind() {
         EntryKind::File | EntryKind::Symlink | EntryKind::Special => {
             remove_existing_non_directory(
-                prog_track,
+                &prog_track,
                 dst_parent,
                 dst_name,
                 dst_path,
