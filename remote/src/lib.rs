@@ -3205,7 +3205,10 @@ fn parse_rcpd_startup_record(line: &str) -> anyhow::Result<RcpdReadiness> {
     parse_rcpd_readiness(line)
 }
 
-async fn read_rcpd_startup_record<R>(reader: &mut R) -> anyhow::Result<RcpdReadiness>
+/// Read and parse the first stderr startup record (`RCP_READY` or `RCP_ERROR`) emitted by `rcpd`.
+///
+/// Enforces the 64 KiB startup record limit and rejects non-UTF-8 or unexpected preamble lines.
+pub async fn read_rcpd_startup_record<R>(reader: &mut R) -> anyhow::Result<RcpdReadiness>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {

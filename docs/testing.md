@@ -683,8 +683,8 @@ are close proxies for the full hosted matrix; a few CI steps live outside them:
 
 ## Simulated Remote Networking (Turmoil)
 
-Two Turmoil integration suites run in the normal Rust test suite (including inside the Nix sandbox,
-with no SSH, Docker, or root required):
+Three Turmoil integration suites run in the normal Rust test suite (including inside the Nix
+sandbox, with no SSH, Docker, or root required):
 
 - **Framing & handshakes (`remote/tests/turmoil_framing.rs`)**: Run with
   `just test -p rcp-tools-remote --test turmoil_framing`. Exercises the real wire codecs,
@@ -700,9 +700,28 @@ with no SSH, Docker, or root required):
   host crashes (`sim.crash`), stalled control/data handshakes in virtual time, transient holds,
   overwrite manifests under latency, best-effort vs `--fail-early`, dry-run, mid-body truncation
   teardown, and a 16-seed chaos sweep asserting no-hang and no-silent-corruption invariants.
+- **Full 3-host `master` + `source` + `destination` orchestration
+  (`rcp/tests/turmoil_three_host.rs`)**: Run with
+  `just test -p rcp-tools-rcp --test turmoil_three_host`. Drives the real
+  [`master_session::run_master_session`](../rcp/src/master_session.rs) over the
+  [`RemoteBackend`](../rcp/src/master_session.rs) seam together with
+  [`daemon_session::run_daemon_session`](../rcp/src/daemon_session.rs) and
+  [`remote::read_rcpd_startup_record`](../remote/src/lib.rs) across three simulated Turmoil hosts
+  (`"master"`, `"source"`, and `"destination"`) with independent per-daemon stdin/stdout/stderr
+  channels and per-edge link health. Covers mTLS and dry-run summary merging, bootstrap readiness
+  faults (`RCP_ERROR` refusal, garbage/oversized stderr, stalled readiness and held/blackholed
+  destination bootstrap timeouts, `F`/`E` and TLS readiness mismatches, automatic concurrency
+  negotiation, and startup-notice draining during unwinding), `SameEndpointNeedsPeerCheck` peer
+  identity resolution, pre-`SourceMasterHello` source failures, master-proxied tunnels
+  (`--remote-transport=ssh` upfront and `--remote-transport=auto` fallback) across a partitioned
+  data plane, in-flight fallback cancellation on source timeout or destination crash, master crash
+  and control-link partition watchdogs (EOF and `KeepaliveTimedOut`), pre-/post-connect failure
+  settlement and teardown error precedence, stdout tracing backpressure, and a 16-seed 3-edge chaos
+  sweep asserting zero orphan daemons, zero leaked tunnels, no hangs, and no silent corruption.
 
-Keep the Docker chaos tests for real Linux kernel TCP behavior, SSH tunneling, and multi-container
-end-to-end paths.
+Keep the localhost SSH and Docker chaos tests for real Linux kernel TCP behavior, OpenSSH
+mux/process mechanics (`ssh -M -N`, `ssh -G`, `known_hosts`, `ForwardAgent`, `PR_SET_PDEATHSIG`,
+auto-deploy staging), and multi-container end-to-end paths.
 
 ## Remote Teardown Trace
 
