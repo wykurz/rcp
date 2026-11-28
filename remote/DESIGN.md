@@ -4,10 +4,9 @@ The `remote` crate owns SSH bootstrap, TCP/TLS transport, stream framing, and sh
 It does not own filesystem traversal or destination writes; those live in `rcp`.
 
 For commands, deployment choices, and troubleshooting, start with
-[remote copy operations](../docs/remote_copy.md). The
-[protocol reference](../docs/remote_protocol.md) remains the detailed specification of messages,
-ordering, resource accounting, and shutdown. This page is a component map, not a second
-specification.
+[remote copy operations](../docs/remote_copy.md). The [protocol design](../docs/remote_protocol.md)
+specifies the messages, their order and what each side guarantees. This page is a component map, not
+a second specification; how a module keeps a guarantee is in that module's own comment.
 
 ## Topology
 
@@ -67,4 +66,4 @@ Keep these boundaries intact when changing the component:
 
 Repository-wide verification guidance belongs in [testing](../docs/testing.md) and measurement
 guidance in [benchmarking](../docs/benchmarking.md). Keep test commands and benchmark procedures
-there; link implementation-specific invariants to the protocol reference rather than copying them.
+there, and keep an invariant of one implementation in the comment of the module that holds it.
