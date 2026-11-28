@@ -88,7 +88,7 @@ async fn dry_run_completes_before_reporting_collected_errors() -> anyhow::Result
                 let settings = settings(dereference);
                 let peer_connected = std::sync::atomic::AtomicBool::new(false);
                 let source_operation = handle_dry_run_connection(
-                    accepted.0,
+                    accepted.0.into(),
                     &settings,
                     source_path,
                     &destination,
@@ -202,7 +202,7 @@ async fn dry_run_aborts_promptly_when_peer_control_drops_during_slow_preview() -
         let source_op = DRY_RUN_PROGRESS_HOOK.scope(
             hook,
             handle_dry_run_connection(
-                accepted.0,
+                accepted.0.into(),
                 &settings,
                 source.path(),
                 &destination,

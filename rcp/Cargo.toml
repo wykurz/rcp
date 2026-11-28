@@ -36,6 +36,7 @@ tempfile = "3"
 # package's tests only build when a workspace-wide run unifies the feature in from another crate's
 # dev-dependency — `cargo test -p rcp-tools-rcp` and `nix build .#rcp` would fail on their own.
 tokio = { version = "1.53", features = ["full", "parking_lot", "tracing", "test-util"] }
+turmoil = "0.7.2"
 
 [dependencies]
 anyhow = "1.0"

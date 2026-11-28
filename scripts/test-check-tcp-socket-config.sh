@@ -59,10 +59,10 @@ run_violation_fixture "$FIXTURES/violations-outside" "user.rs"
 # ── unconfigured helper and stray impl-method accept inside the funnel file (rule 2b) ───────────
 run_violation_fixture "$FIXTURES/violations-funnel" "lib.rs"
 
-# ── the clean fixture: nothing may be reported (exempt file included via override) ──────────────
+# ── the clean fixture: nothing may be reported (exempt file list included via override) ─────────
 set +e
 clean_output=$(TCP_CHECK_FUNNEL_FILE="$FIXTURES/clean/lib.rs" \
-    TCP_CHECK_CONNECT_EXEMPT="$FIXTURES/clean/exempt.rs" \
+    TCP_CHECK_CONNECT_EXEMPT="$FIXTURES/clean/exempt.rs $FIXTURES/clean/second_exempt.rs" \
     "$LINTER" "$FIXTURES/clean" 2>&1)
 clean_status=$?
 set -e
@@ -71,7 +71,7 @@ if [ "$clean_status" -ne 0 ]; then
     echo "$clean_output" | grep -E '^  Line [0-9]+' | sed 's/^/    false positive: /'
     FAILED=1
 else
-    echo -e "${GREEN}  ✓ no false positives on the clean fixture${NC}"
+    echo -e "${GREEN}  ✓ no false positives on the clean fixture (multi-file exempt list)${NC}"
 fi
 
 # ── the vacuous fixture: a funnel missing one owned option must FAIL, not pass vacuously ────────

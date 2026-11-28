@@ -681,23 +681,36 @@ are close proxies for the full hosted matrix; a few CI steps live outside them:
   profile, including chaos, in privileged Compose containers. Use `just depot-chaos` for an explicit
   remote chaos check when changing failure handling or the chaos tests themselves.
 
-## Simulated Remote Framing
+## Simulated Remote Networking (Turmoil)
 
-The remote crate's Turmoil tests run two peers over simulated TCP in the normal Rust test suite.
-They check that an interrupted payload can't complete early, that transfer resumes at the next file
-boundary after the link is released, and that truncating a data socket doesn't break a separate
-control socket.
+Two Turmoil integration suites run in the normal Rust test suite (including inside the Nix sandbox,
+with no SSH, Docker, or root required):
 
-Run just these cases with `just test -p rcp-tools-remote --test turmoil_framing`. They exercise the
-real wire codecs but don't launch daemons or emulate TLS, SSH, or storage. Keep the Docker chaos
-tests for those end-to-end paths.
+- **Framing & handshakes (`remote/tests/turmoil_framing.rs`)**: Run with
+  `just test -p rcp-tools-remote --test turmoil_framing`. Exercises the real wire codecs,
+  [`ControlStreamAcceptor::Auto`](../remote/src/tls.rs) first-byte dispatch, real mTLS 1.3 and
+  simulated-loopback SSH HMAC-SHA256 handshakes, non-loopback SSH-auth rejection, held-link
+  resumption, and virtual-time handshake timeouts.
+- **Full `source` ↔ `destination` protocol (`rcp/tests/turmoil_protocol.rs`)**: Run with
+  `just test -p rcp-tools-rcp --test turmoil_protocol`. Drives the real `run_source_with_transport`
+  and `run_destination_with_transport` copy pipelines over a pluggable
+  [`remote::transport::Transport`](../remote/src/transport.rs) seam (production keeps the
+  `configure_tcp_socket` TCP funnel) with task-scoped per-endpoint `Progress` isolation. Covers mTLS
+  1.3, SSH loopback HMAC, and `Auto` modes; symmetric partitions, asymmetric one-way blackholes,
+  host crashes (`sim.crash`), stalled control/data handshakes in virtual time, transient holds,
+  overwrite manifests under latency, best-effort vs `--fail-early`, dry-run, mid-body truncation
+  teardown, and a 16-seed chaos sweep asserting no-hang and no-silent-corruption invariants.
+
+Keep the Docker chaos tests for real Linux kernel TCP behavior, SSH tunneling, and multi-container
+end-to-end paths.
 
 ## Remote Teardown Trace
 
-The loopback teardown test runs both copy endpoints with a short data body while another file is
-waiting for directory readiness. It checks both error causes and that control closes without Done.
-The [trace model](../rcp/spec/remote-teardown/DESIGN.md) shows how to validate the events emitted by
-that Rust test with TLC. TLC is optional.
+The teardown trace tests (`remote_teardown_trace` over loopback and
+`remote_teardown_trace_over_turmoil` over Turmoil) run both copy endpoints with a short data body
+while another file is waiting for directory readiness. They check both error causes and that control
+closes without Done. The [trace model](../rcp/spec/remote-teardown/DESIGN.md) shows how to validate
+the events emitted by those Rust tests with TLC. TLC is optional.
 
 ## Chaos Testing
 

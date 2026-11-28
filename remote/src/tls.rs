@@ -571,14 +571,84 @@ fn ensure_loopback_peer(ip: std::net::IpAddr, purpose: &str) -> anyhow::Result<(
     Ok(())
 }
 
-async fn accept_tls_stream(
+struct PrefixedStream<S> {
+    prefix: Option<u8>,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    fn new(first_byte: u8, inner: S) -> Self {
+        Self {
+            prefix: Some(first_byte),
+            inner,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PrefixedStream<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(byte) = self.prefix {
+            if buf.remaining() > 0 {
+                self.prefix = None;
+                buf.put_slice(&[byte]);
+            }
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PrefixedStream<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn accept_tls_stream<S>(
     acceptor: &tokio_rustls::TlsAcceptor,
-    stream: tokio::net::TcpStream,
+    stream: S,
     purpose: &str,
 ) -> anyhow::Result<(
     crate::streams::BoxedSendStream,
     crate::streams::BoxedRecvStream,
-)> {
+)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let tls_stream = acceptor
         .accept(stream)
         .await
@@ -591,7 +661,8 @@ async fn accept_tls_stream(
 }
 
 async fn accept_ssh_auth_stream(
-    mut stream: tokio::net::TcpStream,
+    mut stream: crate::transport::BoxedTransportStream,
+    first_byte: Option<u8>,
     secret: &crate::protocol::SshAuthSecret,
     kind: StreamKind,
     purpose: &str,
@@ -605,12 +676,16 @@ async fn accept_ssh_auth_stream(
         .ip();
     ensure_loopback_peer(peer_ip, purpose)?;
     let mut client_hello = [0u8; 36];
-    stream
-        .read_exact(&mut client_hello)
-        .await
-        .with_context(|| {
-            format!("SSH auth handshake failed reading client hello for {purpose} connection")
-        })?;
+    let read_result = match first_byte {
+        Some(byte) => {
+            client_hello[0] = byte;
+            stream.read_exact(&mut client_hello[1..]).await
+        }
+        None => stream.read_exact(&mut client_hello).await,
+    };
+    read_result.with_context(|| {
+        format!("SSH auth handshake failed reading client hello for {purpose} connection")
+    })?;
     if client_hello[..4] != SSH_AUTH_MAGIC {
         anyhow::bail!("SSH auth handshake failed for {purpose} connection: invalid protocol magic");
     }
@@ -651,14 +726,11 @@ async fn accept_ssh_auth_stream(
         );
     }
     let (read_half, write_half) = stream.into_split();
-    Ok(split_into_streams(
-        Box::new(write_half) as crate::streams::BoxedWrite,
-        Box::new(read_half) as crate::streams::BoxedRead,
-    ))
+    Ok(split_into_streams(write_half, read_half))
 }
 
 async fn connect_ssh_auth_stream(
-    mut stream: tokio::net::TcpStream,
+    mut stream: crate::transport::BoxedTransportStream,
     secret: &crate::protocol::SshAuthSecret,
     kind: StreamKind,
     purpose: &str,
@@ -720,19 +792,16 @@ async fn connect_ssh_auth_stream(
         format!("SSH auth handshake failed flushing client proof for {purpose} connection")
     })?;
     let (read_half, write_half) = stream.into_split();
-    Ok(split_into_streams(
-        Box::new(write_half) as crate::streams::BoxedWrite,
-        Box::new(read_half) as crate::streams::BoxedRead,
-    ))
+    Ok(split_into_streams(write_half, read_half))
 }
 
 /// Authenticate and split an accepted source control connection, resolving [`ControlStreamAcceptor::Auto`]
 /// into the concrete [`StreamAcceptor`] to enforce on all subsequent data connections.
 ///
-/// The entire handshake (including first-byte peek in `Auto` mode) is bounded by `timeout`.
+/// The entire handshake (including first-byte dispatch in `Auto` mode) is bounded by `timeout`.
 pub async fn accept_control_bounded(
     acceptor: &ControlStreamAcceptor,
-    stream: tokio::net::TcpStream,
+    stream: impl Into<crate::transport::BoxedTransportStream>,
     timeout: std::time::Duration,
     purpose: &str,
 ) -> anyhow::Result<(
@@ -740,13 +809,11 @@ pub async fn accept_control_bounded(
     crate::streams::BoxedRecvStream,
     StreamAcceptor,
 )> {
+    let mut stream = stream.into();
     match acceptor {
         ControlStreamAcceptor::Plaintext => {
             let (read_half, write_half) = stream.into_split();
-            let (send, recv) = split_into_streams(
-                Box::new(write_half) as crate::streams::BoxedWrite,
-                Box::new(read_half) as crate::streams::BoxedRead,
-            );
+            let (send, recv) = split_into_streams(write_half, read_half);
             Ok((send, recv, StreamAcceptor::Plaintext))
         }
         ControlStreamAcceptor::Tls(tls) => {
@@ -761,7 +828,7 @@ pub async fn accept_control_bounded(
         ControlStreamAcceptor::SshAuth(secret) => {
             let (send, recv) = tokio::time::timeout(
                 timeout,
-                accept_ssh_auth_stream(stream, secret, StreamKind::Control, purpose),
+                accept_ssh_auth_stream(stream, None, secret, StreamKind::Control, purpose),
             )
             .await
             .with_context(|| format!("SSH auth handshake timed out for {purpose} connection"))??;
@@ -769,22 +836,28 @@ pub async fn accept_control_bounded(
         }
         ControlStreamAcceptor::Auto { tls, ssh_auth } => tokio::time::timeout(timeout, async {
             let mut first_byte = [0u8; 1];
-            let peeked = stream
-                .peek(&mut first_byte)
+            let read_len = stream
+                .read(&mut first_byte)
                 .await
-                .with_context(|| format!("handshake peek failed for {purpose} connection"))?;
-            if peeked == 0 {
+                .with_context(|| format!("handshake read failed for {purpose} connection"))?;
+            if read_len == 0 {
                 anyhow::bail!("peer closed {purpose} connection before starting handshake");
             }
             match first_byte[0] {
                 TLS_HANDSHAKE_RECORD_TYPE => {
-                    let (send, recv) = accept_tls_stream(tls, stream, purpose).await?;
+                    let prefixed = PrefixedStream::new(first_byte[0], stream);
+                    let (send, recv) = accept_tls_stream(tls, prefixed, purpose).await?;
                     Ok((send, recv, StreamAcceptor::Tls(Arc::clone(tls))))
                 }
                 b if b == SSH_AUTH_MAGIC[0] => {
-                    let (send, recv) =
-                        accept_ssh_auth_stream(stream, ssh_auth, StreamKind::Control, purpose)
-                            .await?;
+                    let (send, recv) = accept_ssh_auth_stream(
+                        stream,
+                        Some(b),
+                        ssh_auth,
+                        StreamKind::Control,
+                        purpose,
+                    )
+                    .await?;
                     Ok((send, recv, StreamAcceptor::SshAuth(ssh_auth.clone())))
                 }
                 other => {
@@ -799,13 +872,13 @@ pub async fn accept_control_bounded(
     }
 }
 
-/// Authenticate an accepted TCP stream under a concrete [`StreamAcceptor`] and split it into
+/// Authenticate an accepted connection under a concrete [`StreamAcceptor`] and split it into
 /// framed streams, bounding the handshake by `timeout`.
 ///
 /// `purpose` names the connection in error messages (e.g. "control", "data").
 pub async fn accept_bounded(
     acceptor: &StreamAcceptor,
-    stream: tokio::net::TcpStream,
+    stream: impl Into<crate::transport::BoxedTransportStream>,
     timeout: std::time::Duration,
     kind: StreamKind,
     purpose: &str,
@@ -813,13 +886,11 @@ pub async fn accept_bounded(
     crate::streams::BoxedSendStream,
     crate::streams::BoxedRecvStream,
 )> {
+    let stream = stream.into();
     match acceptor {
         StreamAcceptor::Plaintext => {
             let (read_half, write_half) = stream.into_split();
-            Ok(split_into_streams(
-                Box::new(write_half) as crate::streams::BoxedWrite,
-                Box::new(read_half) as crate::streams::BoxedRead,
-            ))
+            Ok(split_into_streams(write_half, read_half))
         }
         StreamAcceptor::Tls(tls) => {
             tokio::time::timeout(timeout, accept_tls_stream(tls, stream, purpose))
@@ -828,14 +899,14 @@ pub async fn accept_bounded(
         }
         StreamAcceptor::SshAuth(secret) => tokio::time::timeout(
             timeout,
-            accept_ssh_auth_stream(stream, secret, kind, purpose),
+            accept_ssh_auth_stream(stream, None, secret, kind, purpose),
         )
         .await
         .with_context(|| format!("SSH auth handshake timed out for {purpose} connection"))?,
     }
 }
 
-/// Authenticate a connected TCP stream under [`StreamConnector`] and split it into framed streams,
+/// Authenticate a connected stream under [`StreamConnector`] and split it into framed streams,
 /// bounding the handshake by `timeout`.
 ///
 /// `server_name` is only an SNI placeholder for TLS — peers are verified by certificate
@@ -843,7 +914,7 @@ pub async fn accept_bounded(
 pub async fn connect_bounded(
     connector: &StreamConnector,
     server_name: &'static str,
-    stream: tokio::net::TcpStream,
+    stream: impl Into<crate::transport::BoxedTransportStream>,
     timeout: std::time::Duration,
     kind: StreamKind,
     purpose: &str,
@@ -851,13 +922,11 @@ pub async fn connect_bounded(
     crate::streams::BoxedSendStream,
     crate::streams::BoxedRecvStream,
 )> {
+    let stream = stream.into();
     match connector {
         StreamConnector::Plaintext => {
             let (read_half, write_half) = stream.into_split();
-            Ok(split_into_streams(
-                Box::new(write_half) as crate::streams::BoxedWrite,
-                Box::new(read_half) as crate::streams::BoxedRead,
-            ))
+            Ok(split_into_streams(write_half, read_half))
         }
         StreamConnector::Tls(tls) => {
             let server_name = ServerName::try_from(server_name)
@@ -1791,5 +1860,89 @@ mod integration_tests {
             client.write_all(&[0x00]).await.unwrap();
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn prefixed_stream_preserves_prefix_on_zero_capacity_read_and_forwards_vectored_writes() {
+        use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+        struct VectoredMock {
+            read_data: std::io::Cursor<Vec<u8>>,
+            vectored_calls: usize,
+            written: Vec<u8>,
+        }
+        impl tokio::io::AsyncRead for VectoredMock {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.read_data).poll_read(cx, buf)
+            }
+        }
+        impl tokio::io::AsyncWrite for VectoredMock {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.written.extend_from_slice(buf);
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_write_vectored(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bufs: &[std::io::IoSlice<'_>],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                self.vectored_calls += 1;
+                let mut total = 0;
+                for slice in bufs {
+                    self.written.extend_from_slice(slice);
+                    total += slice.len();
+                }
+                std::task::Poll::Ready(Ok(total))
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                true
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        let mut stream = PrefixedStream::new(
+            0x16,
+            VectoredMock {
+                read_data: std::io::Cursor::new(vec![0x03, 0x01]),
+                vectored_calls: 0,
+                written: Vec::new(),
+            },
+        );
+        // zero-capacity read must not drop the prefix byte
+        let mut empty = [];
+        assert_eq!(stream.read(&mut empty).await.unwrap(), 0);
+        let mut out = [0u8; 3];
+        stream.read_exact(&mut out).await.unwrap();
+        assert_eq!(out, [0x16, 0x03, 0x01]);
+        // vectored writes must pass through so tokio-rustls keeps writev batching
+        assert!(stream.is_write_vectored());
+        let bufs = [
+            std::io::IoSlice::new(b"tls-"),
+            std::io::IoSlice::new(b"batch"),
+        ];
+        assert_eq!(stream.write_vectored(&bufs).await.unwrap(), 9);
+        assert_eq!(stream.inner.vectored_calls, 1);
+        assert_eq!(stream.inner.written, b"tls-batch");
     }
 }

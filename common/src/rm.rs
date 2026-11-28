@@ -262,7 +262,7 @@ pub async fn rm(
             && settings.filter.is_none()
             && !safedir::strict_operand_resolution(),
         protection: None,
-        prog_track,
+        prog_track: prog_track.into(),
         settings: settings.clone(),
     });
     let root_cx = EntryCx::root(
@@ -322,7 +322,7 @@ pub async fn rm_child(
 /// [`rm_child`], and the shared driver acquires before its own classification. A destructive filter
 /// that already classified the entry uses [`rm_child_admitted_entry`] instead.
 pub(crate) async fn rm_child_admitted(
-    prog_track: &'static progress::Progress,
+    prog_track: impl Into<crate::ProgressRef>,
     parent: &Arc<Dir>,
     name: &OsStr,
     rel_path: &std::path::Path,
@@ -331,7 +331,7 @@ pub(crate) async fn rm_child_admitted(
     protection: Option<Arc<crate::input_protection::InputProtection>>,
 ) -> Result<Summary, Error> {
     rm_child_with_source(
-        prog_track,
+        prog_track.into(),
         parent,
         name,
         rel_path,
@@ -344,7 +344,7 @@ pub(crate) async fn rm_child_admitted(
 
 /// Remove a child using the authoritative entry that informed a destructive filter decision.
 pub(crate) async fn rm_child_admitted_entry(
-    prog_track: &'static progress::Progress,
+    prog_track: impl Into<crate::ProgressRef>,
     parent: &Arc<Dir>,
     name: &OsStr,
     rel_path: &std::path::Path,
@@ -353,7 +353,7 @@ pub(crate) async fn rm_child_admitted_entry(
     protection: Option<Arc<crate::input_protection::InputProtection>>,
 ) -> Result<Summary, Error> {
     rm_child_with_source(
-        prog_track,
+        prog_track.into(),
         parent,
         name,
         rel_path,
@@ -371,7 +371,7 @@ enum RmChildSource {
 
 #[allow(clippy::too_many_arguments)]
 async fn rm_child_with_source(
-    prog_track: &'static progress::Progress,
+    prog_track: crate::ProgressRef,
     parent: &Arc<Dir>,
     name: &OsStr,
     rel_path: &std::path::Path,
@@ -384,7 +384,7 @@ async fn rm_child_with_source(
     let visitor = Arc::new(RmVisitor {
         use_leaf_snapshot: false,
         protection,
-        prog_track,
+        prog_track: prog_track.clone(),
         settings: settings.clone(),
     });
     let root_cx = EntryCx::seeded(
@@ -409,7 +409,7 @@ struct RmVisitor {
     // only standalone, unfiltered removal may use a snapshot to account for a by-name unlink
     use_leaf_snapshot: bool,
     protection: Option<Arc<crate::input_protection::InputProtection>>,
-    prog_track: &'static progress::Progress,
+    prog_track: crate::ProgressRef,
     settings: Settings,
 }
 
@@ -479,7 +479,7 @@ impl WalkVisitor for RmVisitor {
             .transpose()
             .with_context(|| format!("failed removing {:?}", display_path()))
             .map_err(|err| Error::new(err, Summary::default()))?;
-        Ok(removed.map(|entry| account_removed_leaf(self.prog_track, entry.kind(), entry.size())))
+        Ok(removed.map(|entry| account_removed_leaf(&self.prog_track, entry.kind(), entry.size())))
     }
 
     fn permit_kind(&self) -> PermitKind {
@@ -526,7 +526,7 @@ impl WalkVisitor for RmVisitor {
         leaf: AdmittedLeaf,
     ) -> Result<Summary, Error> {
         let kind = leaf.kind();
-        let prog_track = self.prog_track;
+        let prog_track = &self.prog_track;
         let settings = &self.settings;
         let parent = &cx.parent;
         let name = cx.name.as_os_str();
@@ -725,7 +725,7 @@ impl WalkVisitor for RmVisitor {
         state: RmDirState,
         child_result: DirPostInput<Self>,
     ) -> Result<Summary, Error> {
-        let prog_track = self.prog_track;
+        let prog_track = &self.prog_track;
         let settings = &self.settings;
         let path = cx.real_path.as_path();
         let RmDirState {
@@ -950,7 +950,7 @@ mod tests {
             .with_relative_path(Path::new("logical-filter-coordinate").into());
             let visitor = Arc::new(RmVisitor {
                 protection: None,
-                prog_track: &FIXTURE_PROGRESS,
+                prog_track: (&FIXTURE_PROGRESS).into(),
                 use_leaf_snapshot: true,
                 settings: Settings {
                     fail_early: false,
@@ -1049,7 +1049,7 @@ mod tests {
         // filter, in a pruning copy, and for an entry whose listing names no type
         let visitor = Arc::new(RmVisitor {
             protection: None,
-            prog_track: &FIXTURE_PROGRESS,
+            prog_track: (&FIXTURE_PROGRESS).into(),
             use_leaf_snapshot: false,
             settings: Settings {
                 fail_early: false,
@@ -1654,7 +1654,7 @@ mod tests {
             let visitor = Arc::new(RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &PROGRESS,
+                prog_track: (&PROGRESS).into(),
                 settings,
             });
             let root_cx = EntryCx::root(
@@ -2421,7 +2421,7 @@ mod tests {
             let visitor = Arc::new(RmVisitor {
                 use_leaf_snapshot: true,
                 protection: None,
-                prog_track: &PROGRESS,
+                prog_track: (&PROGRESS).into(),
                 settings: Settings {
                     fail_early: true,
                     filter: None,
@@ -2500,7 +2500,7 @@ mod tests {
             let visitor = Arc::new(RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &PROGRESS,
+                prog_track: (&PROGRESS).into(),
                 settings: settings.clone(),
             });
             let cx = EntryCx::root(
@@ -2563,7 +2563,7 @@ mod tests {
             let visitor = RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &RACE_PROGRESS,
+                prog_track: (&RACE_PROGRESS).into(),
                 settings: Settings {
                     fail_early: true,
                     filter: None,
@@ -2610,7 +2610,7 @@ mod tests {
             let visitor = RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &RACE_PROGRESS,
+                prog_track: (&RACE_PROGRESS).into(),
                 settings: Settings {
                     fail_early: true,
                     filter: None,
@@ -2653,7 +2653,7 @@ mod tests {
             let visitor = RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &RACE_PROGRESS,
+                prog_track: (&RACE_PROGRESS).into(),
                 settings: Settings {
                     fail_early: true,
                     filter: None,
@@ -2702,7 +2702,7 @@ mod tests {
             let visitor = RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &RACE_PROGRESS,
+                prog_track: (&RACE_PROGRESS).into(),
                 settings: Settings {
                     fail_early: true,
                     filter: None,
@@ -2795,7 +2795,7 @@ mod tests {
             let visitor = RmVisitor {
                 use_leaf_snapshot: false,
                 protection: None,
-                prog_track: &RACE_PROGRESS,
+                prog_track: (&RACE_PROGRESS).into(),
                 settings: Settings {
                     fail_early: true,
                     filter: Some(filter),

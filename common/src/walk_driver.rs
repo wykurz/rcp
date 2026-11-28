@@ -132,8 +132,8 @@ pub struct EntryCx {
     /// Source operand or diagnostic display path, extended by one name per level.
     /// Copy also uses it for deliberately path-based dereferencing. Removal never opens it.
     pub real_path: PathBuf,
-    /// The process-global progress tracker.
-    pub prog_track: &'static Progress,
+    /// Active progress tracker (process-global or task-scoped).
+    pub prog_track: crate::ProgressRef,
 }
 
 impl EntryCx {
@@ -142,14 +142,14 @@ impl EntryCx {
         parent: Arc<Dir>,
         name: OsString,
         real_path: PathBuf,
-        prog_track: &'static Progress,
+        prog_track: impl Into<crate::ProgressRef>,
     ) -> Self {
         Self {
             parent,
             name,
             rel_path: PathBuf::new(),
             real_path,
-            prog_track,
+            prog_track: prog_track.into(),
         }
     }
 
@@ -158,7 +158,7 @@ impl EntryCx {
         parent: Arc<Dir>,
         name: OsString,
         path: PathBuf,
-        prog_track: &'static Progress,
+        prog_track: impl Into<crate::ProgressRef>,
     ) -> Self {
         Self::root(parent, name, path.clone(), prog_track).with_relative_path(path)
     }
@@ -202,7 +202,7 @@ impl PreparedChild<'_> {
             rel_path: self.rel_path,
             real_path: walk::join_path(&self.parent.real_path, Path::new(&self.name)),
             name: self.name,
-            prog_track: self.parent.prog_track,
+            prog_track: self.parent.prog_track.clone(),
         }
     }
 }
@@ -968,7 +968,8 @@ async fn process_scheduled_entry<V>(
 where
     V: WalkVisitor,
 {
-    let _ops_guard = cx.prog_track.ops.guard();
+    let ops_progress = cx.prog_track.clone();
+    let _ops_guard = ops_progress.ops.guard();
     dispatch_scheduled_entry(visitor, cx, parent_ctx, ordinal, scheduled).await
 }
 
@@ -979,12 +980,13 @@ async fn process_hinted_entry<V>(
     parent_ctx: V::DirContext,
     ordinal: usize,
     scheduled: ScheduledEntry,
-    prog_track: &'static Progress,
+    prog_track: crate::ProgressRef,
 ) -> Result<WalkEntryResult<V::Summary>, OperationError<V::Summary>>
 where
     V: WalkVisitor,
 {
-    let _ops_guard = prog_track.ops.guard();
+    let ops_progress = prog_track.clone();
+    let _ops_guard = ops_progress.ops.guard();
     let directory = match &owner {
         HintedDirectoryOwner::Owned(directory) => directory,
         HintedDirectoryOwner::Shared(directory) => directory.as_ref(),
@@ -1042,7 +1044,7 @@ where
         let summary = filter_skip_summary(
             visitor.as_ref(),
             &SkippedEntry::from_entry(&cx),
-            cx.prog_track,
+            &cx.prog_track,
             classified.kind(),
             &skip_result,
         );
@@ -1165,7 +1167,7 @@ where
                 fold.add_summary(filter_skip_summary(
                     visitor.as_ref(),
                     &child.skipped(),
-                    parent_cx.prog_track,
+                    &parent_cx.prog_track,
                     hinted_kind,
                     &skip_result,
                 ));
@@ -1213,7 +1215,7 @@ where
                     task_ctx,
                     ordinal,
                     scheduled,
-                    parent_cx.prog_track,
+                    parent_cx.prog_track.clone(),
                 ),
             ),
         }
