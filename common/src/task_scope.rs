@@ -144,16 +144,22 @@ mod tests {
 
     #[tokio::test]
     async fn scope_progress_isolates_counters_across_spawn_tracked() {
-        let global_before = crate::get_progress().files_copied.get();
+        assert!(std::ptr::eq(
+            &*crate::current_progress(),
+            crate::get_progress()
+        ));
         let a = Arc::new(crate::progress::Progress::new());
         let b = Arc::new(crate::progress::Progress::new());
         let run_endpoint = |prog: Arc<crate::progress::Progress>, count: u64| async move {
-            scope_progress(prog, async move {
+            scope_progress(Arc::clone(&prog), async move {
                 scope_tasks(async move {
                     let mut set = tokio::task::JoinSet::new();
                     for _ in 0..count {
+                        let expected = Arc::clone(&prog);
                         spawn_tracked(&mut set, async move {
-                            crate::current_progress().files_copied.inc();
+                            let current = crate::current_progress();
+                            assert!(std::ptr::eq(&*current, Arc::as_ptr(&expected)));
+                            current.files_copied.inc();
                         });
                     }
                     while let Some(res) = set.join_next().await {
@@ -170,6 +176,9 @@ mod tests {
         );
         assert_eq!(a.files_copied.get(), 3);
         assert_eq!(b.files_copied.get(), 5);
-        assert_eq!(crate::get_progress().files_copied.get(), global_before);
+        assert!(std::ptr::eq(
+            &*crate::current_progress(),
+            crate::get_progress()
+        ));
     }
 }
