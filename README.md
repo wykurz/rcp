@@ -402,6 +402,10 @@ rcp --local-copy-handoff=never SOURCE DESTINATION
   `~user` forms are not supported.
 - Remote paths may be absolute, start with `~/`, or be relative. Relative remote paths are resolved
   against the local current working directory before being used remotely.
+- Only a leading `~` expands, by itself or before `/`: `host:~//docs` is `HOME/docs`, and a later
+  `~` is literal, so `host:~/~/file` is `HOME/~/file`. `.` and `..` are left as written.
+- `localhost:/path` is the local path `/path`, and so is a path under `127.0.0.1:` or `[::1]:`,
+  unless `--force-remote` is given. This is how to name a local path that contains a colon.
 
 ## Throttling
 

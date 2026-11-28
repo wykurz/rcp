@@ -102,34 +102,13 @@ A preview does not create its destination or verify that file contents can be re
 Sharing an SSH session does not enable the local overlap checks: remote source and destination trees
 must be disjoint (see [remote overlap limits](tocttou.md#remote-sourcedestination-overlap)).
 
-**Auto-deployment compatibility:** Auto-deployment applies the same exact compatibility policy as
-normal remote discovery at both boundaries. The master runs `--protocol-version` on each local
-candidate in search order (beside `rcp`, then the local shell's POSIX `command -v rcpd`) and
-continues to later candidates when one is stale, stalls its two-second version probe, or is
-otherwise unusable. An ordinary local PATH miss is retained in the final searched-candidates
-diagnostic. A timed-out local candidate has its pipes released and receives a kill request; the
-invocation cleanup supervisor retains child ownership and reaps it while the search continues. The
-selected local deployment payload is read on a cleanup-owned disposable OS worker under the same
-configured bootstrap deadline and peer cancellation. A blocked filesystem syscall can finish later
-on that worker, but it cannot retain Tokio runtime or remote-resource ownership. Remote discovery
-uses the remote shell's `command -v rcpd` rather than an external `which`. Remote version probes,
-including post-deployment verification, use the initiating `rcp` process's
-`--remote-copy-conn-timeout-sec` deadline so slow-but-healthy hosts can be given an appropriate
-budget without allowing a hanging SSH channel to block fallback indefinitely. The master names the
-cache target with the accepted version's compatibility tag, transfers and publishes the binary, then
-probes that deployed remote path before constructing either role's spawn command. Thus neither
-co-location nor a current-looking cache filename is treated as proof that the binary implements the
-current serialized and rcpd spawn contract. For distinct hosts, the first preparation failure
-cooperatively cancels its peer without dropping owned work or replacing the original error. SSH
-control-socket readiness uses the same configured deadline and one cancellation-aware filesystem
-worker for its whole polling lifetime. Every read-only remote bootstrap command — HOME lookup,
-executable checks, PATH discovery, and version probes — goes through one helper that requires that
-per-stage timeout; expiry aborts and joins its local SSH-channel task. Remote cache cleanup is best
-effort and uses the same bounded helper. Binary deployment uses the timeout for its HOME lookup, SSH
-command, readiness marker, and each payload-write idle period, but not as a wall-clock limit on
-transmitting the binary. Post-EOF checksum verification and publication use a bounded stage of at
-least 60 seconds. On peer cancellation, the transfer gets a bounded grace to close stdin and finish
-before its local SSH-channel task is aborted and joined.
+**Binary discovery and deployment:** A daemon binary is used only after it has answered
+`--protocol-version` with this build's compatibility identity. That holds for a binary found on the
+remote host and for one the master has just deployed there: neither where a binary lies nor what its
+file is called is taken as proof that it implements the current serialized and spawn contract. For
+distinct hosts, the first preparation failure cancels the preparation of the other endpoint and
+stays the error that is reported. [Remote copy operations](remote_copy.md#deployment-workflow)
+describes discovery and deployment for operators.
 
 The SSH multiplex master runs as a retained foreground `ssh -M -N` process spawned on the dedicated
 `rcp-cleanup-supervisor` OS thread; on Linux, `PR_SET_PDEATHSIG(SIGTERM)` (with a post-fork
@@ -187,28 +166,6 @@ scope one bounded budget to wait for its last resource owner, supervisor, and ev
 work still blocked after that grace is abandoned with the process. Daemon waits run concurrently
 across endpoints while tracing receivers stay live, then any remaining receiver tasks share one
 final drain deadline.
-
-Normal daemon discovery does not require `HOME`: when it is absent, the deployed-cache candidate is
-skipped and same-directory/PATH discovery continues. Remote `~` expansion and deployment into the
-cache do require a usable `HOME`, so those operations fail with a targeted diagnostic instead of
-constructing a path under `/`. Expansion recognizes only a leading `~` by itself or followed by `/`.
-Repeated separators immediately after it remain home-relative, while subsequent `~` path components
-are literal: `host:~//docs` resolves to `HOME/docs`, and `host:~/~/file` to `HOME/~/file`. Local
-quoted operands and the `localhost:` escape hatch use the same suffix rules with the local `HOME`.
-Expansion does not canonicalize `.` or `..` components.
-
-Deployment stages, verifies, and publishes through one remote `sh` transaction. Before anything can
-create the unique temp path, that shell installs an `EXIT` trap which removes it. After directory
-creation and opening the staging file on descriptor 3, it emits `RCP_DEPLOY_READY` on stdout. The
-master bounds and validates that marker before sending payload bytes; bounded stdout preamble and
-stderr are retained when setup fails. Checksum mismatch, transfer failure, SSH-channel disconnect,
-and handled `HUP`/`INT`/`TERM` therefore all clean up in the same process that owns the writer. Only
-a checksum-verified file reaches the final same-directory rename. Cancellation closes staging stdin
-and waits briefly for the command while its owner drains both pipes; after that grace the local
-SSH-channel task is aborted and joined. The configured timeout limits idle payload writes, not total
-binary-transmission duration. The remote shell retains durable cleanup ownership independently of
-the local Tokio task. A temp name surviving an unhandled remote termination is private to that
-deployment and is never discovered, executed, or adopted by a retry.
 
 **Startup stderr ownership and notices:** A successfully started daemon reserves its first stderr
 line for exactly one readiness record. The master bounds both SSH exec-channel creation and that
