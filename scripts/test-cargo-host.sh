@@ -779,7 +779,7 @@ if [ "${CARGO_HOST_TEST_SKIP_LINT_RECIPE:-}" != 1 ]; then
 fi
 check_just_recipe build 'build --workspace'
 check_just_recipe build-release 'build --workspace --release'
-check_just_recipe doc 'doc --no-deps --workspace'
+check_just_recipe doc 'doc --no-deps --workspace --document-private-items'
 check_just_recipe test 'nextest run'
 check_just_recipe test-release 'nextest run --release'
 # shard selection and spaced filters must reach Cargo as separate, intact arguments.

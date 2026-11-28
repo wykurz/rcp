@@ -242,7 +242,7 @@ impl Semaphore {
         self.flag.store(false, Ordering::Release);
     }
 
-    /// Re-enable this semaphore after [`disable`], so `consume` / `acquire`
+    /// Re-enable this semaphore after [`Self::disable`], so `consume` / `acquire`
     /// once again wait on the inner pool. Requires that the current epoch has
     /// a nonzero configured limit — otherwise there are no permits for callers
     /// to wait on, and flipping the flag would strand them. Returns `true` if

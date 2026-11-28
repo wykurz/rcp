@@ -104,7 +104,7 @@ fn peak_rss_bytes(vmhwm_kb: Option<u64>, usage: &libc::rusage) -> u64 {
 
 /// What the calling process used, from getrusage(2).
 ///
-/// It covers every thread, unlike the context switch counts in /proc/[pid]/status, which are
+/// It covers every thread, unlike the context switch counts in `/proc/[pid]/status`, which are
 /// those of one thread, and it counts CPU time in microseconds where /proc counts clock ticks.
 fn resource_usage() -> std::io::Result<libc::rusage> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
@@ -1800,7 +1800,7 @@ fn resolve_log_path(path: &std::path::Path, trace_identifier: &str) -> std::path
 }
 
 /// Verify the resolved histogram log path can actually be opened for
-/// writing. Called from [`run`] before any work begins so a typo or
+/// writing. Called from [`crate::run`] before any work begins so a typo or
 /// permission issue surfaces as a configuration error rather than a
 /// silent warning at runtime.
 ///
