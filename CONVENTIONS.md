@@ -36,3 +36,5 @@
 
 - Markdown files are formatted with dprint (see `dprint.json`): prose hard-wrapped at 100 columns.
   Run `just fmt` to format; `just lint` (and CI) verify.
+- What belongs in a design document, in a module comment and in a comment at the code is in
+  [AGENTS.md](AGENTS.md#documentation).

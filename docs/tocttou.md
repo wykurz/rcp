@@ -4,6 +4,10 @@ This document describes Time-of-Check-Time-of-Use (TOCTTOU) race condition vulne
 affect the RCP tools when used with elevated privileges, and documents the Linux hardening. The
 examples below use `rcp`, but the attack pattern applies to the other tools as well.
 
+It states what the hardening guarantees and why. A statement belongs here if it would still be true
+after the implementation was rewritten to the same design; how the code keeps a guarantee is in the
+module comments of `common` (see its [component design](../common/DESIGN.md)).
+
 ## Table of Contents
 
 - [Overview](#overview)

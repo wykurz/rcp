@@ -1,8 +1,13 @@
 # Remote Copy Protocol Design Document
 
-This is the detailed implementation reference. Start with the
-[remote component design](../remote/DESIGN.md) for the ownership and source map, or
-[remote copy operations](remote_copy.md) for user-facing setup and troubleshooting. Test and
+This document describes the design of the remote copy protocol: what the master and the two daemons
+are responsible for, the messages they exchange and in what order, what each side guarantees, and
+why the design is this way. A statement belongs here if it would still be true after the
+implementation was rewritten to the same design. How the code keeps a guarantee, with its tasks,
+timeouts, buffers and error handling, is in the module comments of the `remote` and `rcp` crates;
+the [remote component design](../remote/DESIGN.md) maps them.
+
+For user-facing setup and troubleshooting see [remote copy operations](remote_copy.md). Test and
 measurement procedures belong in [testing](testing.md) and [benchmarking](benchmarking.md).
 
 ## 1. Architecture Overview

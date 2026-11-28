@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents when working with code in this r
 
 For project overview and tool descriptions, see [README.md](README.md). For coding conventions, see
 [CONVENTIONS.md](CONVENTIONS.md). For design and reference documentation, see the [docs/](docs/)
-directory.
+directory, and [Documentation](#documentation) for what is written where.
 
 ## Library API Scope
 
@@ -208,8 +208,9 @@ read catches missed exit paths, aliasing, and invariant gaps that a single pass 
 
 ### TOCTOU Checks Must Bind the Action
 
-Before changing filesystem-race hardening, read [docs/tocttou.md](docs/tocttou.md) and keep its
-guarantees aligned with the implementation.
+Before changing filesystem-race hardening, read [docs/tocttou.md](docs/tocttou.md): its guarantees
+are what the implementation must keep. A change that alters a guarantee changes the document with
+it; any other change leaves it as it is (see [Documentation](#documentation)).
 
 A check is security-bearing only when the action uses the same held descriptor or open file
 description, later work uses the verified held descriptor, or one kernel primitive makes the check
@@ -219,6 +220,66 @@ bind that action; do not add one or describe it as fail-closed.
 A by-name action through a pinned parent guarantees containment and syscall type, not exact
 final-component identity; a compatible replacement may be affected. Kind, size, and metadata may
 still guide filtering, planning, dispatch, and accounting when they are documented as snapshots.
+
+## Documentation
+
+What the project knows is written at three levels, and each fact has one home. A fact written at the
+wrong level is what makes a document grow until nobody reads it.
+
+- **Design**: [docs/remote_protocol.md](docs/remote_protocol.md), [docs/tocttou.md](docs/tocttou.md)
+  and every `DESIGN.md`. What the parts are responsible for, what they promise each other (messages,
+  their order, guarantees), and why the design is this way.
+- **Module**: the `//!` comment at the top of a module. How this module keeps its promises: what it
+  owns, how its parts work together, its ordering, limits and timeouts.
+- **Item**: `///` and `//` at the code. Why this function, branch or constant is the way it is.
+
+**The test for a design document:** a statement belongs there if it would still be true after the
+implementation was rewritten to the same design. How a promise is kept belongs in the module that
+keeps it. In the remote protocol, for example:
+
+- **Design.** "The destination sends `DestinationDone` and closes its control send stream;
+  `DestinationDone` triggers source shutdown." A message and its order between two parts.
+- **Module.** "The stdout writer skips a queued control frame whose acknowledgement receiver was
+  dropped." True of one implementation: it belongs in the module comment of that writer.
+- **Both.** What a field on the wire means and why it exists is design. What its receiver does with
+  it, such as which wait it shortens and by how much, is the receiver's module.
+
+### Read the design, and usually leave it alone
+
+Read the design documents of an area before changing it: they say what must stay true. Most changes
+then need no edit to them, because most changes alter how a promise is kept and not the promise.
+Edit a design document only when the change makes one of its statements false, or changes the design
+itself: a message, an ordering, a guarantee, a responsibility. That is rare and deserves a second
+look, so say in the pull request which statement changed and why. When no edit was needed, say that
+as well ("read `docs/remote_protocol.md`: no change"): it is the expected outcome, not an omission.
+
+A design document does not record what a change did, how a bug came about, or how something is
+implemented. What changed and why goes in the commit message and the pull request. What a user will
+notice goes in `CHANGELOG.md`, in two or three lines.
+
+### Module comments
+
+Give a module a `//!` comment when it owns behaviour that its function signatures do not show: what
+the module is for, what it promises its callers, and how its parts work together. When you are about
+to explain an implementation in a design document, this is where it goes. Keep the comment current:
+when you change how the module works, change it in the same commit. Link the items it names
+(``[`Type`]``, ``[`function`]``): `just doc` fails on a broken link in the documentation it builds,
+where a name in a Markdown file goes stale unnoticed.
+
+### Guides for users and operators
+
+`README.md`, `docs/remote_copy.md`, `docs/acls.md`, `docs/security.md` and the guides under
+`infra/aws_benchmark/` are for people who run the tools. They change when what such a person does or
+sees changes: a flag, a default, an output, a step. They do not explain internals.
+
+### When reviewing
+
+- An addition to a design document is a finding unless the design changed. Ask for it to move into
+  the module comment, or to be dropped.
+- Do not ask for a design document to be updated because the implementation changed. If an
+  explanation is missing, ask for a module or item comment.
+- A statement in a design document that has become false is a finding. It is corrected if it is
+  design, and otherwise deleted or moved into the code.
 
 ## Testing
 
@@ -245,9 +306,10 @@ For test categories, Docker multi-host tests, chaos tests, and sudo-required tes
 ## Remote Operations
 
 Before making any changes to remote copy operations, **always read
-[docs/remote_protocol.md](docs/remote_protocol.md) first**. It is the source of truth for protocol
-behavior and must be kept in sync with the implementation. For operational aspects (binary
-discovery, deployment, connectivity), see [docs/remote_copy.md](docs/remote_copy.md).
+[docs/remote_protocol.md](docs/remote_protocol.md) first**. It says what the master and the two
+daemons promise each other, and a change must keep those promises or change the document with them.
+Most changes need no edit to it (see [Documentation](#documentation)). For operational aspects
+(binary discovery, deployment, connectivity), see [docs/remote_copy.md](docs/remote_copy.md).
 
 **Remote tests** require localhost SSH available and usable (`ssh localhost` must succeed). Tests
 fail fast if unavailable — they are never skipped based on environment.
@@ -273,6 +335,10 @@ Keep **Rebase and merge** as the only allowed GitHub merge method and preserve r
 history. GitHub replays the PR commits onto the current base when it merges the PR; a separate
 branch update is unnecessary for unrelated base changes. Existing required PR checks remain in
 force, and full CI on `main` verifies the combined result after merge.
+
+When the change is in an area that has a design document, say in the PR description what reading it
+led to: no edit, which is the usual case, or which statement changed and why (see
+[Documentation](#documentation)).
 
 After creating a PR, check all review comments (including automated ones from Copilot). Evaluate
 each on its merit — address valid suggestions and respond to ones that aren't applicable.
