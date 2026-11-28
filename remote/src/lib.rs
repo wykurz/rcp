@@ -1664,6 +1664,12 @@ pub(crate) fn finish_remote_output_capture(
     }
 }
 
+/// How long one stage of preparing an endpoint may take.
+///
+/// The remote commands of the bootstrap (the `HOME` lookup, executable checks, `PATH` discovery,
+/// version probes) and the stages of a deployment each wait under one of these, so that a hanging
+/// SSH channel ends its own stage instead of blocking what would be tried next. The limit is per
+/// stage: it does not bound how long a binary takes to transmit.
 #[derive(Clone, Copy)]
 pub(crate) struct BootstrapDeadline(std::time::Duration);
 
@@ -2146,6 +2152,11 @@ impl Drop for StopSocketProbe {
     }
 }
 
+/// Wait until `inspect` finds the control socket of the SSH multiplex master.
+///
+/// One worker of its own polls for the whole wait and stops when this future is dropped. The
+/// caller's deadline or a cancelled preparation therefore ends the wait without leaving a poller
+/// behind, and no filesystem call that could block runs on the runtime.
 async fn wait_for_ssh_control_socket<F>(
     cleanup: &RemoteCleanup,
     mut inspect: F,
@@ -3623,6 +3634,20 @@ where
     }
 }
 
+/// Prepare one endpoint: a session to the host, and the path of an `rcpd` there that this build can
+/// talk to.
+///
+/// Every step waits at most `bootstrap_timeout` and ends early when the preparation of the other
+/// endpoint fails:
+///
+/// 1. Open the SSH session, unless the caller hands in one that it has already authenticated.
+/// 2. Discover an `rcpd` on the host and ask it for its protocol version
+///    ([`try_discover_and_check_version`]).
+/// 3. When none is compatible and deployment is allowed, find a compatible local binary, deploy it
+///    (see [`deploy`]), and ask the published path for its protocol version as well. Where a binary
+///    lies or what its file is called is never taken as proof that it is compatible.
+/// 4. Remove all but the newest cached versions. A failure of this step is logged and does not
+///    fail the preparation.
 #[instrument(skip(preparation, existing_session))]
 #[allow(clippy::too_many_arguments)]
 async fn prepare_rcpd_with_context(

@@ -3,6 +3,31 @@
 //! This module handles automatic deployment of rcpd binaries to remote hosts.
 //! It transfers static rcpd binaries via SSH using base64 encoding, verifies integrity with SHA-256 checksums, and manages cached versions.
 //!
+//! ## Stages and their limits
+//!
+//! A deployment runs in stages. Each waits at most the bootstrap timeout of the invocation
+//! (`--remote-copy-conn-timeout-sec`) and ends at once when the preparation of the other endpoint
+//! fails:
+//!
+//! 1. A local candidate is found, beside `rcp` and then on `PATH`, and asked for its protocol
+//!    version. One that does not answer within `LOCAL_RCPD_VERSION_TIMEOUT` is rejected and the
+//!    search goes on.
+//! 2. The binary is read on a worker of its own, so that a filesystem that hangs cannot hold up
+//!    the runtime.
+//! 3. The remote transaction starts and prints `DEPLOYMENT_READY_RECORD` once its staging file is
+//!    open. No payload is sent before that record has arrived and been checked.
+//! 4. The payload is written. The timeout bounds a write that makes no progress, not the transfer
+//!    as a whole: a large binary over a slow link is not a failure.
+//! 5. After the last byte, verification and publication get the timeout or
+//!    `REMOTE_STAGING_FINALIZATION_MINIMUM`, whichever is longer.
+//!
+//! When the other endpoint fails in the middle, the transaction gets `REMOTE_STAGING_OWNER_GRACE`
+//! to see its input close and finish; after that the local end of the channel is aborted. The
+//! remote shell's `EXIT` trap removes the staging file in either case.
+//!
+//! The caller asks the published path for its protocol version once more before using it: a file
+//! in the cache is not taken for a compatible one because of its name.
+//!
 //! ## Atomicity and Concurrent Deployment Safety
 //!
 //! The deployment mechanism is designed to handle concurrent deployments from multiple rcp instances safely:
